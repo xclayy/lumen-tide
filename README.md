@@ -1,7 +1,12 @@
 # Lumen Tide
 
+[![make.fun · best-game-01](https://make.fun/badge/best-game-01.svg)](https://make.fun/bounty/best-game-01?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+[![rank](https://make.fun/badge/best-game-01/xclayy/lumen-tide/rank.svg)](https://make.fun/bounty/best-game-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+[![reward](https://make.fun/badge/best-game-01/xclayy/lumen-tide/reward.svg)](https://make.fun/bounty/best-game-01?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+
 A lantern-skiff arena shooter for make.fun's **best-game-01** bounty
-($1,000 USDC, deadline Thu 19 Nov 2026 01:00 WIB).
+($1,000 USDC, deadline Thu 19 Nov 2026 01:00 WIB) — see the bounty at
+https://make.fun/bounty/best-game-01.
 
 Keep the lantern lit. Burn the shadows back. Survive the tide.
 

@@ -1,8 +1,8 @@
 # EMBERKEEP — Nine Nights of the Last Flame
 
 [![make.fun](https://make.fun/badge/best-game-01.svg)](https://make.fun/bounty/best-game-01)
-[![Rank](https://make.fun/badge/xclayy/lumen-tide/rank.svg)](https://make.fun/bounty/best-game-01)
-[![Reward](https://make.fun/badge/xclayy/lumen-tide/reward.svg)](https://make.fun/bounty/best-game-01)
+[![Rank](https://make.fun/badge/best-game-01/xclayy/lumen-tide/rank.svg)](https://make.fun/bounty/best-game-01)
+[![Reward](https://make.fun/badge/best-game-01/xclayy/lumen-tide/reward.svg)](https://make.fun/bounty/best-game-01)
 
 A 2D canvas arena-defence game for the [make.fun "Make the best game" bounty](https://make.fun/bounty/best-game-01).
 

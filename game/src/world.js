@@ -41,6 +41,8 @@ export function createWorld(random) {
         dashTime: 0,
         dashCooldown: 0,
         fireTimer: 0,
+        muzzle: 0,
+        wakeTimer: 0,
         rapidTimer: 0,
         spreadTimer: 0,
         shieldTimer: 0,
@@ -68,7 +70,8 @@ export function createWorld(random) {
   }
 
   /** The mix a wave throws at the player: wisps always, shades from
-   * wave 2, glooms from wave 3, a dread on every fifth wave. */
+   * wave 2, glooms from wave 3, spitters from wave 4, a dread on
+   * every fifth wave. */
   function waveMix(wave) {
     const mix = [];
     const total = WAVE.baseCount + WAVE.perWave * (wave - 1);
@@ -78,6 +81,7 @@ export function createWorld(random) {
       if (wave >= 5 && i === 0) kind = 'dread';
       else if (wave >= 3 && roll < 0.2) kind = 'gloom';
       else if (wave >= 2 && roll < 0.45) kind = 'shade';
+      else if (wave >= 4 && roll < 0.6) kind = 'spitter';
       mix.push(kind);
     }
     return mix;
@@ -111,6 +115,7 @@ export function createWorld(random) {
       angle: 0,
       wobble: random.range(0, TAU),
       burstTimer: kind === 'dread' ? 2.5 : 0,
+      spitTimer: kind === 'spitter' ? 1.8 : 0,
       flash: 0,
     };
     state.enemies.push(enemy);
@@ -182,7 +187,7 @@ export function createWorld(random) {
           radius: ENEMY.wisp.radius, hp: 1, maxHp: 1,
           speed: ENEMY.wisp.speed * random.range(1, 1.3),
           score: ENEMY.wisp.score, angle: 0,
-          wobble: random.range(0, TAU), burstTimer: 0, flash: 0,
+          wobble: random.range(0, TAU), burstTimer: 0, spitTimer: 0, flash: 0,
         });
       }
     }
@@ -211,6 +216,20 @@ export function createWorld(random) {
     return EVENT_HIT;
   }
 
+  /** A spitter's aimed bolt: one slow shot straight at the lantern,
+   * telegraphed by the burst it leaves at the maw. */
+  function spitAimedBolt(enemy) {
+    const a = angleTo(enemy.x, enemy.y, state.player.x, state.player.y);
+    state.enemyBullets.push({
+      x: enemy.x + Math.cos(a) * (enemy.radius + 6),
+      y: enemy.y + Math.sin(a) * (enemy.radius + 6),
+      vx: Math.cos(a) * 210,
+      vy: Math.sin(a) * 210,
+      radius: 6,
+    });
+    burst(enemy.x, enemy.y, ENEMY.spitter.color, 4, 120, 0.3);
+  }
+
   function stepPlayer(dt, move, aim, firing, dash) {
     const player = state.player;
     player.invulnerable = Math.max(0, player.invulnerable - dt);
@@ -219,6 +238,8 @@ export function createWorld(random) {
     player.spreadTimer = Math.max(0, player.spreadTimer - dt);
     player.shieldTimer = Math.max(0, player.shieldTimer - dt);
     player.fireTimer -= dt;
+    player.muzzle = Math.max(0, player.muzzle - dt);
+    player.wakeTimer -= dt;
     player.lamp = Math.max(PLAYER.lampBase, player.lamp - PLAYER.lampDecay * dt);
     player.angle = angleTo(player.x, player.y, aim.x, aim.y);
 
@@ -239,8 +260,24 @@ export function createWorld(random) {
     player.x = Math.min(FIELD.width - PLAYER.radius, Math.max(PLAYER.radius, player.x));
     player.y = Math.min(FIELD.height - PLAYER.radius, Math.max(PLAYER.radius, player.y));
 
+    // A moving skiff leaves a fading wake on the tide.
+    if ((move.x !== 0 || move.y !== 0) && player.wakeTimer <= 0) {
+      player.wakeTimer = 0.06;
+      state.particles.push({
+        x: player.x - move.x * 20,
+        y: player.y - move.y * 20,
+        vx: -move.x * 30,
+        vy: -move.y * 30,
+        radius: 3,
+        life: 0.5,
+        maxLife: 0.5,
+        color: '#2f5d7d',
+      });
+    }
+
     if (firing && player.fireTimer <= 0) {
       player.fireTimer = player.rapidTimer > 0 ? PLAYER.rapidInterval : PLAYER.fireInterval;
+      player.muzzle = 0.07;
       const angles = player.spreadTimer > 0 ? [-0.22, 0, 0.22] : [0];
       for (const offset of angles) {
         const a = player.angle + offset;
@@ -271,6 +308,21 @@ export function createWorld(random) {
         const perp = angle + Math.PI / 2;
         vx += Math.cos(perp) * Math.sin(enemy.wobble) * 120;
         vy += Math.sin(perp) * Math.sin(enemy.wobble) * 120;
+      }
+      if (enemy.kind === 'spitter') {
+        // Hold a firing lane: close in past 320, back off inside 220,
+        // strafe while the maw charges, then spit an aimed bolt.
+        enemy.wobble += dt * 2;
+        const d = Math.sqrt(dist2(enemy.x, enemy.y, player.x, player.y)) || 1;
+        const hold = d > 320 ? 1 : d < 220 ? -0.8 : 0;
+        const perp = angle + Math.PI / 2;
+        vx = Math.cos(angle) * enemy.speed * hold + Math.cos(perp) * Math.sin(enemy.wobble) * 60;
+        vy = Math.sin(angle) * enemy.speed * hold + Math.sin(perp) * Math.sin(enemy.wobble) * 60;
+        enemy.spitTimer -= dt;
+        if (enemy.spitTimer <= 0) {
+          enemy.spitTimer = 3.0;
+          spitAimedBolt(enemy);
+        }
       }
       if (enemy.kind === 'dread') {
         enemy.burstTimer -= dt;
@@ -439,7 +491,7 @@ export function createWorld(random) {
       }
     }
     if (attract) {
-      if (state.enemies.length < 9 && random.chance(0.02)) spawnEnemy('wisp');
+      if (state.enemies.length < 14 && random.chance(0.02)) spawnEnemy('wisp');
       for (const enemy of state.enemies) {
         enemy.wobble += dt * 2;
         enemy.x += Math.cos(enemy.wobble) * 24 * dt;

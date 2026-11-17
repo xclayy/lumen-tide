@@ -23,6 +23,7 @@ export const PLAYER = {
 export const ENEMY = {
   wisp: { radius: 14, hp: 1, speed: 95, score: 10, color: '#7fe7ff' },
   shade: { radius: 16, hp: 2, speed: 175, score: 25, color: '#c792ff' },
+  spitter: { radius: 15, hp: 2, speed: 70, score: 35, color: '#ff9e5e' },
   gloom: { radius: 27, hp: 5, speed: 48, score: 50, color: '#ff7a9e' },
   dread: { radius: 46, hp: 26, speed: 58, score: 300, color: '#ffb347' },
 };

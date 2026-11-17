@@ -37,31 +37,28 @@ export function stageShot(name, world) {
     // Sail through waves 1-4 with a bold pilot, stopping the instant
     // wave 5 opens, before the dread has spawned. Then close in
     // WITHOUT firing, so the dread stays healthy and drifts on screen
-    // with its escorts; a final short burst puts bullets in flight
-    // toward it without burning it down.
+    // with its escorts; wait until it has loosed a radial burst, then
+    // a final short burst puts bullets in flight toward it without
+    // burning it down.
     playForward(world, 120, (state) => autopilot(state, 'bold'), (events, state) => state.wave >= 5 && state.waveActive);
-    playForward(world, 6, (state) => {
+    playForward(world, 8, (state) => {
       const orders = autopilot(state, 'bold');
       orders.firing = false;
       return orders;
     }, (events, state) => {
       const dread = state.enemies.find((e) => e.kind === 'dread');
-      return Boolean(dread && dread.x > 80 && dread.x < 1200 && dread.y > 80 && dread.y < 640 && state.enemies.length >= 3);
+      return Boolean(dread && dread.x > 80 && dread.x < 1200 && dread.y > 80 && dread.y < 640 && state.enemies.length >= 3 && state.enemyBullets.length >= 3);
     });
     playForward(world, 0.7, (state) => autopilot(state, 'bold'));
     return { screen: SCREEN_PLAY, best: world.state.score };
   }
 
   if (name === 'over') {
-    // A hurried pilot that never dashes: it is caught out once the
-    // tide quickens, as a new player is. If it somehow survives, the
-    // last phase sails straight into the nearest shadow, so the scene
-    // always ends in a genuine game over.
-    playForward(world, OVER_LIMIT_SECONDS, (state) => {
-      const orders = autopilot(state, 'bold');
-      orders.dash = false;
-      return orders;
-    });
+    // A careful pilot at full strength: it sails deep into the tide
+    // before the shadows finally catch it, as a good run ends. If it
+    // somehow survives, the last phase sails straight into the
+    // nearest shadow, so the scene always ends in a genuine game over.
+    playForward(world, OVER_LIMIT_SECONDS, (state) => autopilot(state, 'careful'));
     if (world.state.player.hearts > 0) {
       playForward(world, 120, (state) => {
         let target = null;
@@ -85,8 +82,21 @@ export function stageShot(name, world) {
     return { screen: SCREEN_OVER, best: world.state.score };
   }
 
-  // Play: a careful pilot through the opening waves, frozen the moment
-  // a wave is properly under way — enemies on screen, bullets flying.
-  playForward(world, 40, (state) => autopilot(state, 'careful'), (events, state) => state.waveActive && state.enemies.length >= 5 && state.bullets.length >= 2);
+  // Play: a careful pilot through the opening waves, frozen at the
+  // richest moment — a mid-wave brawl with shadows closing in, bolts
+  // in flight and a combo running. If the brawl never peaks, fall
+  // back to the first lively wave; if the pilot somehow sinks, start
+  // over and take the first lively frame instead.
+  playForward(world, 75, (state) => autopilot(state, 'careful'), (events, state) =>
+    state.waveActive && state.wave >= 3 && state.enemies.length >= 6 &&
+    state.bullets.length >= 3 && (state.multiplier >= 2 || state.particles.length >= 8));
+  if (world.state.player.hearts <= 0) {
+    world.reset();
+    playForward(world, 30, (state) => autopilot(state, 'careful'), (events, state) =>
+      state.waveActive && state.enemies.length >= 4 && state.bullets.length >= 2);
+  } else if (!(world.state.waveActive && world.state.enemies.length >= 5 && world.state.bullets.length >= 2)) {
+    playForward(world, 20, (state) => autopilot(state, 'careful'), (events, state) =>
+      state.waveActive && state.enemies.length >= 5 && state.bullets.length >= 2);
+  }
   return { screen: SCREEN_PLAY, best: world.state.score };
 }

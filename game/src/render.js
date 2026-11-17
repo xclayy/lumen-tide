@@ -45,6 +45,7 @@ export function createRenderer(canvas) {
     bullet: glowSprite('#ffe9a8', 14),
     wisp: glowSprite('#7fe7ff', 30),
     shade: glowSprite('#c792ff', 34),
+    spitter: glowSprite('#ff9e5e', 34),
     gloom: glowSprite('#ff7a9e', 54),
     dread: glowSprite('#ffb347', 90),
     orb: glowSprite('#ffd166', 22),
@@ -60,7 +61,7 @@ export function createRenderer(canvas) {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-  for (let i = 0; i < 70; i += 1) {
+  for (let i = 0; i < 110; i += 1) {
     motes.push({
       x: moteRandom() * FIELD.width,
       y: moteRandom() * FIELD.height,
@@ -89,9 +90,9 @@ export function createRenderer(canvas) {
     ctx.fillRect(0, 0, FIELD.width, FIELD.height);
     // Slow tide bands.
     ctx.save();
-    ctx.globalAlpha = 0.16;
+    ctx.globalAlpha = 0.2;
     ctx.strokeStyle = COLORS.tide;
-    ctx.lineWidth = 26;
+    ctx.lineWidth = 30;
     for (let i = 0; i < 4; i += 1) {
       ctx.beginPath();
       const baseY = 140 + i * 150;
@@ -115,6 +116,15 @@ export function createRenderer(canvas) {
       ctx.fill();
     }
     ctx.restore();
+    // Vignette: the edges of the tide stay dark, so the lantern reads.
+    const vignette = ctx.createRadialGradient(
+      FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.42,
+      FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.95,
+    );
+    vignette.addColorStop(0, 'rgba(2,8,16,0)');
+    vignette.addColorStop(1, 'rgba(2,8,16,0.5)');
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, FIELD.width, FIELD.height);
   }
 
   function drawLamp(player) {
@@ -123,6 +133,13 @@ export function createRenderer(canvas) {
     ctx.globalAlpha = 0.5;
     ctx.drawImage(sprites.lamp, player.x - size / 2, player.y - size / 2, size, size);
     ctx.restore();
+    // A tight bright core right around the skiff, so it never sinks
+    // into the dark even when the lamp is at its smallest.
+    const core = player.lamp * 0.55;
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.drawImage(sprites.lamp, player.x - core, player.y - core, core * 2, core * 2);
+    ctx.restore();
   }
 
   function drawPlayer(player, time) {
@@ -130,9 +147,10 @@ export function createRenderer(canvas) {
     if (blink) return;
     ctx.save();
     ctx.translate(player.x, player.y);
-    // Hull: a small skiff pointing at the aim.
+    // Hull: a small skiff pointing at the aim, gold-rimmed so it
+    // reads against the dark tide at a glance.
     ctx.rotate(player.angle);
-    ctx.fillStyle = '#2b4a63';
+    ctx.fillStyle = '#3d6f8e';
     ctx.beginPath();
     ctx.moveTo(20, 0);
     ctx.lineTo(-14, -11);
@@ -140,9 +158,22 @@ export function createRenderer(canvas) {
     ctx.lineTo(-14, 11);
     ctx.closePath();
     ctx.fill();
+    ctx.strokeStyle = '#ffd166';
+    ctx.lineWidth = 2;
+    ctx.stroke();
     ctx.fillStyle = '#ffd166';
     ctx.fillRect(-4, -3, 10, 6);
     ctx.restore();
+    // Muzzle flash at the bow while a bolt leaves the lantern.
+    if (player.muzzle > 0) {
+      const frac = player.muzzle / 0.07;
+      const mx = player.x + Math.cos(player.angle) * (PLAYER.radius + 12);
+      const my = player.y + Math.sin(player.angle) * (PLAYER.radius + 12);
+      ctx.save();
+      ctx.globalAlpha = frac;
+      ctx.drawImage(sprites.bullet, mx - 18 * frac, my - 18 * frac, 36 * frac, 36 * frac);
+      ctx.restore();
+    }
     // The lantern flame.
     const flame = 1 + 0.12 * Math.sin(time * 9);
     ctx.drawImage(sprites.player, player.x - 16 * flame, player.y - 16 * flame, 32 * flame, 32 * flame);
@@ -178,57 +209,83 @@ export function createRenderer(canvas) {
     ctx.restore();
     ctx.save();
     ctx.translate(enemy.x, enemy.y);
+    // A bright rim around every shadow, so each kind reads against
+    // the dark tide even when its glow is faint.
+    ctx.save();
+    ctx.strokeStyle = def.color;
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, enemy.radius * 0.85, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
     if (enemy.kind === 'wisp') {
       ctx.fillStyle = '#dff8ff';
       ctx.beginPath();
-      ctx.arc(0, 0, 7, 0, TAU);
+      ctx.arc(0, 0, 10, 0, TAU);
       ctx.fill();
       ctx.fillStyle = '#0a2436';
       ctx.beginPath();
-      ctx.arc(-2.5, -1, 1.8, 0, TAU);
-      ctx.arc(2.5, -1, 1.8, 0, TAU);
+      ctx.arc(-3.5, -1.5, 2.2, 0, TAU);
+      ctx.arc(3.5, -1.5, 2.2, 0, TAU);
       ctx.fill();
     } else if (enemy.kind === 'shade') {
       ctx.rotate(enemy.angle);
       ctx.fillStyle = '#e6d4ff';
       ctx.beginPath();
-      ctx.moveTo(12, 0);
-      ctx.lineTo(-10, -9);
-      ctx.lineTo(-5, 0);
-      ctx.lineTo(-10, 9);
+      ctx.moveTo(15, 0);
+      ctx.lineTo(-12, -11);
+      ctx.lineTo(-6, 0);
+      ctx.lineTo(-12, 11);
       ctx.closePath();
+      ctx.fill();
+    } else if (enemy.kind === 'spitter') {
+      ctx.rotate(enemy.angle);
+      // A lanternfish: teardrop body with a glowing maw that flares
+      // while a bolt is charging.
+      ctx.fillStyle = '#ffd9b0';
+      ctx.beginPath();
+      ctx.moveTo(15, 0);
+      ctx.quadraticCurveTo(2, -11, -11, -7);
+      ctx.quadraticCurveTo(-14, 0, -11, 7);
+      ctx.quadraticCurveTo(2, 11, 15, 0);
+      ctx.fill();
+      const charging = enemy.spitTimer < 0.45;
+      ctx.fillStyle = charging ? '#fff3c4' : '#ff9e5e';
+      ctx.beginPath();
+      ctx.arc(12, 0, charging ? 6 : 4, 0, TAU);
       ctx.fill();
     } else if (enemy.kind === 'gloom') {
       ctx.fillStyle = '#ffdce4';
       ctx.beginPath();
-      ctx.arc(0, 0, 15, 0, TAU);
+      ctx.arc(0, 0, 18, 0, TAU);
       ctx.fill();
       ctx.fillStyle = '#5c1020';
       ctx.beginPath();
-      ctx.arc(-5, -3, 3, 0, TAU);
-      ctx.arc(5, -3, 3, 0, TAU);
+      ctx.arc(-6, -4, 3.5, 0, TAU);
+      ctx.arc(6, -4, 3.5, 0, TAU);
       ctx.fill();
       ctx.strokeStyle = '#5c1020';
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.arc(0, 4, 6, 0.15 * Math.PI, 0.85 * Math.PI);
+      ctx.arc(0, 5, 7, 0.15 * Math.PI, 0.85 * Math.PI);
       ctx.stroke();
     } else {
       const pulse = 1 + 0.06 * Math.sin(time * 5);
       ctx.scale(pulse, pulse);
       ctx.fillStyle = '#ffe1ad';
       ctx.beginPath();
-      ctx.arc(0, 0, 26, 0, TAU);
+      ctx.arc(0, 0, 30, 0, TAU);
       ctx.fill();
       ctx.fillStyle = '#7a3c00';
       ctx.beginPath();
-      ctx.arc(-9, -6, 4.5, 0, TAU);
-      ctx.arc(9, -6, 4.5, 0, TAU);
+      ctx.arc(-11, -7, 5, 0, TAU);
+      ctx.arc(11, -7, 5, 0, TAU);
       ctx.fill();
       ctx.strokeStyle = '#7a3c00';
       ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.arc(0, 6, 10, 0.2 * Math.PI, 0.8 * Math.PI);
+      ctx.arc(0, 7, 12, 0.2 * Math.PI, 0.8 * Math.PI);
       ctx.stroke();
     }
     ctx.restore();
@@ -315,6 +372,33 @@ export function createRenderer(canvas) {
     ctx.restore();
   }
 
+  /** Every bolt drags a short trail behind it, so a volley reads as
+   * a volley instead of a scatter of dots. */
+  function drawBulletTrails(state) {
+    ctx.save();
+    ctx.strokeStyle = '#ffe9a8';
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath();
+    for (const bullet of state.bullets) {
+      ctx.moveTo(bullet.x - bullet.vx * 0.035, bullet.y - bullet.vy * 0.035);
+      ctx.lineTo(bullet.x, bullet.y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /** A pulsing red edge when the last heart is lit: the tide is
+   * closing in and the player can see it. */
+  function drawDangerVignette(state, time) {
+    ctx.save();
+    ctx.strokeStyle = `rgba(255,93,115,${0.35 + 0.25 * Math.sin(time * 6)})`;
+    ctx.lineWidth = 10;
+    ctx.strokeRect(5, 5, FIELD.width - 10, FIELD.height - 10);
+    ctx.restore();
+  }
+
   function heart(x, y, filled) {
     ctx.save();
     ctx.translate(x, y);
@@ -370,7 +454,8 @@ export function createRenderer(canvas) {
     ctx.fillStyle = COLORS.dim;
     ctx.font = '13px system-ui, sans-serif';
     ctx.fillText(`BEST ${best}`, FIELD.width - 18, 56);
-    // Combo meter, right side under the score.
+    // Combo meter, right side under the score: the multiplier once
+    // the chain is long, the chain count while it builds.
     if (state.multiplier > 1) {
       ctx.fillStyle = '#ffd166';
       ctx.font = 'bold 20px system-ui, sans-serif';
@@ -378,6 +463,14 @@ export function createRenderer(canvas) {
       ctx.fillStyle = 'rgba(255,209,102,0.3)';
       ctx.fillRect(FIELD.width - 118, 96, 100, 6);
       ctx.fillStyle = '#ffd166';
+      ctx.fillRect(FIELD.width - 118, 96, 100 * (state.comboTimer / 3), 6);
+    } else if (state.combo >= 3) {
+      ctx.fillStyle = '#ffe9a8';
+      ctx.font = 'bold 17px system-ui, sans-serif';
+      ctx.fillText(`CHAIN ${state.combo}`, FIELD.width - 18, 88);
+      ctx.fillStyle = 'rgba(255,233,168,0.3)';
+      ctx.fillRect(FIELD.width - 118, 96, 100, 6);
+      ctx.fillStyle = '#ffe9a8';
       ctx.fillRect(FIELD.width - 118, 96, 100 * (state.comboTimer / 3), 6);
     }
     // Dash cooldown, bottom centre.
@@ -421,7 +514,7 @@ export function createRenderer(canvas) {
     ctx.fillText('SPACE — dash    ·    P — pause    ·    M — mute', FIELD.width / 2, 348);
     ctx.fillStyle = '#ffd166';
     ctx.font = 'bold 17px system-ui, sans-serif';
-    ctx.fillText('Wisps 10  ·  Shades 25  ·  Glooms 50  ·  Dreads 300', FIELD.width / 2, 392);
+    ctx.fillText('Wisps 10  ·  Shades 25  ·  Spitters 35  ·  Glooms 50  ·  Dreads 300', FIELD.width / 2, 392);
     ctx.fillStyle = COLORS.dim;
     ctx.font = '15px system-ui, sans-serif';
     ctx.fillText('Kills inside your light pay +50%. Chain kills for combo x5.', FIELD.width / 2, 420);
@@ -511,6 +604,7 @@ export function createRenderer(canvas) {
     if (screen !== SCREEN_TITLE) drawLamp(state.player);
     for (const pickup of state.pickups) drawPickup(pickup, time);
     for (const enemy of state.enemies) drawEnemy(enemy, time);
+    drawBulletTrails(state);
     for (const bullet of state.bullets) {
       ctx.drawImage(sprites.bullet, bullet.x - 14, bullet.y - 14, 28, 28);
     }
@@ -526,6 +620,7 @@ export function createRenderer(canvas) {
     drawParticles(state);
     if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED) drawHud(state, best);
     if (screen === SCREEN_PLAY) drawWaveBanner(state);
+    if (screen === SCREEN_PLAY && state.player.hearts === 1) drawDangerVignette(state, time);
     ctx.restore();
     if (state.flash > 0) {
       ctx.save();

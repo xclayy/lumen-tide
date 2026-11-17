@@ -1,548 +1,1240 @@
-// The tide itself: the world holds the player, enemies, bullets,
-// pickups and particles, and steps them forward in fixed slices.
-// Everything the renderer draws and the autopilot steers lives here.
-import { COMBO, ENEMY, FIELD, PICKUP, PLAYER, STEP, WAVE } from './config.js';
+// EMBERKEEP — the simulation. One pure-ish state object plus an update step.
+// Screens: 'title' | 'playing' | 'intermission' | 'gameover' | 'victory'.
+// All gameplay randomness flows through the seeded rng, so a seed replays.
+import {
+  VIEW, ARENA, DIFFICULTIES, REALMS, NIGHTS, FINAL_NIGHT, NIGHT_PLANS,
+  ENEMIES, ENEMY_ORDER, BOSSES, RELICS, SHOP, REROLL_COST, FEATS,
+  GRADES, NIGHT_CLEAR_BONUS, BOSS_BONUS, PLAYER, FLAME_PER_KILL, EMBERS_PER_KILL,
+  NIGHT_STORIES, ELITE_CHANCE, ELITE_HP_MUL, ELITE_VALUE_MUL, ELITE_SPEED_MUL,
+  BOSS_ENRAGE_TIME, BOSS_ENRAGE_MUL, BOSS_DIALOGUE, REST_COST, GAMBLE_COST,
+} from './config.js';
+import { createRandom, pickWeighted, shuffle } from './random.js';
+import { createEffects, addShake, addHitStop, addFlash, showBanner, burst, maybeLightning, updateEffects } from './effects.js';
 
-export const EVENT_HIT = 1;
-export const EVENT_OVER = 2;
-export const EVENT_KILL = 4;
-export const EVENT_WAVE = 8;
-export const EVENT_PICKUP = 16;
+export function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+export function dist(ax, ay, bx, by) { return Math.hypot(ax - bx, ay - by); }
+export function angleTo(ax, ay, bx, by) { return Math.atan2(by - ay, bx - ax); }
 
-const TAU = Math.PI * 2;
+const HISTORY_KEY = 'emberkeep_history_v1';
+const BEST_KEY = 'emberkeep_best_v1';
 
-function angleTo(ax, ay, bx, by) {
-  return Math.atan2(by - ay, bx - ax);
+export function loadHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return []; }
 }
-
-function dist2(ax, ay, bx, by) {
-  const dx = bx - ax;
-  const dy = by - ay;
-  return dx * dx + dy * dy;
+export function loadBest() {
+  try { return JSON.parse(localStorage.getItem(BEST_KEY) || '{}'); } catch { return {}; }
 }
-
-export function createWorld(random) {
-  const state = freshState();
-  let spawnQueue = [];
-  let spawnTimer = 0;
-  let betweenTimer = 0;
-  let elapsed = 0;
-
-  function freshState() {
-    return {
-      player: {
-        x: FIELD.width / 2,
-        y: FIELD.height / 2,
-        vx: 0,
-        vy: 0,
-        angle: -Math.PI / 2,
-        hearts: PLAYER.maxHearts,
-        invulnerable: 0,
-        dashTime: 0,
-        dashCooldown: 0,
-        fireTimer: 0,
-        muzzle: 0,
-        wakeTimer: 0,
-        rapidTimer: 0,
-        spreadTimer: 0,
-        shieldTimer: 0,
-        lamp: PLAYER.lampBase,
-      },
-      bullets: [],
-      enemyBullets: [],
-      enemies: [],
-      pickups: [],
-      particles: [],
-      texts: [],
-      wave: 0,
-      waveActive: false,
-      kills: 0,
-      shotsFired: 0,
-      shotsHit: 0,
-      score: 0,
-      combo: 0,
-      comboTimer: 0,
-      multiplier: 1,
-      shake: 0,
-      flash: 0,
-      time: 0,
-    };
-  }
-
-  /** The mix a wave throws at the player: wisps always, shades from
-   * wave 2, glooms from wave 3, spitters from wave 4, a dread on
-   * every fifth wave. */
-  function waveMix(wave) {
-    const mix = [];
-    const total = WAVE.baseCount + WAVE.perWave * (wave - 1);
-    for (let i = 0; i < total; i += 1) {
-      let kind = 'wisp';
-      const roll = random.next();
-      if (wave >= 5 && i === 0) kind = 'dread';
-      else if (wave >= 3 && roll < 0.2) kind = 'gloom';
-      else if (wave >= 2 && roll < 0.45) kind = 'shade';
-      else if (wave >= 4 && roll < 0.6) kind = 'spitter';
-      mix.push(kind);
+export function saveRun(record) {
+  try {
+    const hist = loadHistory();
+    hist.unshift(record);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(hist.slice(0, 5)));
+    const best = loadBest();
+    const key = record.difficulty;
+    if (!best[key] || record.score > best[key].score) {
+      best[key] = { score: record.score, grade: record.grade, nights: record.nights, date: record.date };
+      localStorage.setItem(BEST_KEY, JSON.stringify(best));
     }
-    return mix;
+  } catch { /* storage unavailable: the run still counts in-session */ }
+}
+
+export function gradeFor(score) {
+  for (const g of GRADES) if (score >= g.min) return g;
+  return GRADES[GRADES.length - 1];
+}
+
+export function createWorld(seed, difficultyId) {
+  const diff = DIFFICULTIES.find((d) => d.id === difficultyId) || DIFFICULTIES[1];
+  const rng = createRandom(seed);
+  const w = {
+    seed, rng, diff,
+    screen: 'title',
+    fx: createEffects(),
+    codexTab: 0,
+    time: 0, runTime: 0,
+    night: 0, realm: 0,
+    score: 0, embers: 0,
+    player: freshPlayer(),
+    enemies: [], bolts: [], ebullets: [], pickups: [], traps: [], particles: [], floats: [],
+    spawnQueue: [], spawnTimer: 0, boss: null, bossSpawned: false,
+    introT: 0, introText: '', introSub: '',
+    nightKills: 0, nightDamage: false, nightShots: 0, nightHits: 0,
+    killsWindow: [], // timestamps of recent kills (triple kill feat)
+    combo: { count: 0, timer: 0 },
+    telegraphs: [],
+    tipsShown: 0,
+    nightStats: [],
+    lanceCd: 0,
+    relics: [], relicCounts: {},
+    feats: new Set(), featsNew: [],
+    shop: SHOP.map((s) => ({ ...s, bought: 0 })),
+    relicChoices: [],
+    stats: { kills: 0, shots: 0, hits: 0, bosses: 0, relicsTaken: 0, embersEarned: 0, nightsCleared: 0, lanceHits: 0, elitesKilled: 0 },
+    paused: false, over: null, victory: null,
+    message: '', messageT: 0, dialogue: null,
+    history: loadHistory(), best: loadBest(),
+    selectedDiff: 1,
+  };
+  return w;
+}
+
+export function freshPlayer() {
+  return {
+    x: VIEW.W / 2, y: VIEW.H / 2 + 60, vx: 0, vy: 0,
+    radius: PLAYER.radius, hearts: PLAYER.hearts, maxHearts: PLAYER.hearts,
+    flame: PLAYER.maxFlame, maxFlame: PLAYER.maxFlame,
+    aim: -Math.PI / 2, fireT: 0,
+    dashT: 0, dashCd: 0, dashDir: 0, invulnT: 0,
+    // build stats (mutated by relics/shop)
+    shots: 1, damageMul: 1, fireRateMul: 1, speedMul: 1, magnetMul: 1,
+    dashCharges: 1, dashMax: 1, dashCooldownMul: 1, trapSlots: PLAYER.trapSlots,
+    thorns: 0, emberMul: 1, frost: false, blast: false, phoenix: 0,
+    trapCd: 0, slowT: 0, shield: false, lucky: false, secondWind: false, oil: false,
+  };
+}
+
+export function realmOf(night) {
+  return Math.min(2, Math.floor((night - 1) / 3));
+}
+
+export function nightName(night) {
+  const plan = NIGHT_PLANS[night - 1];
+  if (plan.boss) return BOSSES[plan.boss].name;
+  return `NIGHT ${night}`;
+}
+
+// ---------------------------------------------------------------------------
+// Night setup: build the spawn queue for a night from its plan.
+// ---------------------------------------------------------------------------
+export function startNight(w, night) {
+  w.night = night;
+  w.realm = realmOf(night);
+  const plan = NIGHT_PLANS[night - 1];
+  const diff = w.diff;
+  const count = Math.round(plan.budget * diff.spawnMul);
+  const queue = [];
+  const entries = Object.entries(plan.mix);
+  for (let i = 0; i < count; i += 1) {
+    queue.push(pickWeighted(w.rng, entries));
+  }
+  w.spawnQueue = shuffle(w.rng, queue);
+  w.spawnTimer = 1.2;
+  w.boss = null;
+  w.bossSpawned = false;
+  w.nightKills = 0;
+  w.nightDamage = false;
+  w.nightShots = 0;
+  w.nightHits = 0;
+  w.introT = 2.6;
+  // Ember Shield re-arms every night if the relic is owned.
+  if (w.relicCounts.emberShield) w.player.shield = true;
+  const boss = plan.boss ? BOSSES[plan.boss] : null;
+  w.introText = boss ? boss.name : `NIGHT ${night}`;
+  w.introSub = boss ? boss.title : NIGHT_STORIES[night - 1];
+  w.screen = 'playing';
+  if (boss) showBanner(w.fx, boss.name, boss.title, 2.6);
+}
+
+export function spawnEnemy(w, type, x, y) {
+  const cfg = ENEMIES[type];
+  const diff = w.diff;
+  const edge = pickEdge(w);
+  const px = x !== undefined ? x : edge.x;
+  const py = y !== undefined ? y : edge.y;
+  const e = {
+    type, name: cfg.name, x: px, y: py,
+    vx: 0, vy: 0, angle: 0,
+    hp: Math.max(1, Math.round(cfg.hp * diff.hpMul)),
+    maxHp: Math.max(1, Math.round(cfg.hp * diff.hpMul)),
+    speed: cfg.speed * diff.speedMul * (0.9 + w.rng() * 0.2),
+    radius: cfg.radius, damage: cfg.damage, value: cfg.value,
+    color: cfg.color, glow: cfg.glow,
+    behaviour: cfg.behaviour, t: w.rng() * 10, phase: 0, phaseT: 0,
+    solid: true, fireT: 1 + w.rng() * 1.5, chargeT: 3 + w.rng() * 2,
+    charging: 0, telegraph: 0, slowT: 0, flashT: 0, wobble: w.rng() * Math.PI * 2,
+    elite: false,
+  };
+  // Realm variants: the realms change the foes. Ash crawlers are faster and
+  // leave embers; deep wraiths fade longer and move faster while faded.
+  if (w.realm === 1 && type === 'crawler') {
+    e.speed *= 1.15;
+    e.value += 10;
+  }
+  if (w.realm === 2 && type === 'wraith') {
+    e.speed *= 1.15;
+  }
+  // One in ten foes is ember-touched: golden, tougher, worth far more.
+  if (w.rng() < ELITE_CHANCE) {
+    e.elite = true;
+    e.hp = Math.round(e.hp * ELITE_HP_MUL);
+    e.maxHp = e.hp;
+    e.value = Math.round(e.value * ELITE_VALUE_MUL);
+    e.speed *= ELITE_SPEED_MUL;
+    e.radius = Math.round(e.radius * 1.25);
+  }
+  w.enemies.push(e);
+  return e;
+}
+
+function pickEdge(w) {
+  const side = Math.floor(w.rng() * 4);
+  const m = 30;
+  if (side === 0) return { x: ARENA.x + m + w.rng() * (ARENA.w - m * 2), y: ARENA.y + m };
+  if (side === 1) return { x: ARENA.x + m + w.rng() * (ARENA.w - m * 2), y: ARENA.y + ARENA.h - m };
+  if (side === 2) return { x: ARENA.x + m, y: ARENA.y + m + w.rng() * (ARENA.h - m * 2) };
+  return { x: ARENA.x + ARENA.w - m, y: ARENA.y + m + w.rng() * (ARENA.h - m * 2) };
+}
+
+export function spawnBoss(w, bossId) {
+  const cfg = BOSSES[bossId];
+  const diff = w.diff;
+  const b = {
+    id: bossId, name: cfg.name, title: cfg.title,
+    x: VIEW.W / 2, y: ARENA.y + 120,
+    vx: 0, vy: 0, angle: Math.PI / 2,
+    hp: Math.round(cfg.hp * diff.hpMul), maxHp: Math.round(cfg.hp * diff.hpMul),
+    speed: cfg.speed * diff.speedMul, radius: cfg.radius, value: cfg.value,
+    color: cfg.color, glow: cfg.glow,
+    attacks: cfg.attacks, phases: cfg.phases,
+    t: 0, burstT: 3, summonT: 6, chargeT: 8, chargeState: 0, chargeDir: 0,
+    phaseIdx: 0, flashT: 0, drainT: 0, slowT: 0, enraged: false,
+  };
+  w.boss = b;
+  w.bossSpawned = true;
+  // Bosses speak before the fight: two lines, shown as messages.
+  w.dialogue = { lines: BOSS_DIALOGUE[bossId] || [], idx: 0, t: 0 };
+  if (w.dialogue.lines.length > 0) {
+    w.message = w.dialogue.lines[0];
+    w.messageT = 2.6;
+  }
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// Player update: movement, dash, firing, traps, pickups, flame drain.
+// ---------------------------------------------------------------------------
+export function updatePlayer(w, dt, input, audio) {
+  const p = w.player;
+  if (p.invulnT > 0) p.invulnT -= dt;
+  if (p.dashCd > 0) p.dashCd -= dt;
+  if (p.trapCd > 0) p.trapCd -= dt;
+  if (p.fireT > 0) p.fireT -= dt;
+
+  const ax = input.axis();
+  const speed = PLAYER.speed * p.speedMul;
+  if (p.dashT > 0) {
+    p.dashT -= dt;
+    p.x += Math.cos(p.dashDir) * PLAYER.dashSpeed * dt;
+    p.y += Math.sin(p.dashDir) * PLAYER.dashSpeed * dt;
+    spawnParticles(w, p.x, p.y, 2, '#ffd94f', 90, 0.3);
+  } else {
+    p.x += ax.x * speed * dt;
+    p.y += ax.y * speed * dt;
+  }
+  p.x = clamp(p.x, ARENA.x + p.radius, ARENA.x + ARENA.w - p.radius);
+  p.y = clamp(p.y, ARENA.y + p.radius, ARENA.y + ARENA.h - p.radius);
+
+  // Aim at the mouse.
+  p.aim = angleTo(p.x, p.y, input.mouse.x, input.mouse.y);
+
+  // Dash: Space, or Shift. Costs a charge, restores one per cooldown.
+  if ((input.pressed('Space') || input.pressed('ShiftLeft')) && p.dashCd <= 0 && p.dashCharges > 0) {
+    const dir = (ax.x !== 0 || ax.y !== 0) ? Math.atan2(ax.y, ax.x) : p.aim;
+    p.dashDir = dir;
+    p.dashT = PLAYER.dashTime;
+    p.dashCharges -= 1;
+    p.dashCd = PLAYER.dashCooldown * p.dashCooldownMul;
+    p.invulnT = Math.max(p.invulnT, 0.35);
+    audio.play('dash');
+  }
+  if (p.dashCd <= 0 && p.dashCharges < p.dashMax) {
+    p.dashCharges += 1;
+    p.dashCd = PLAYER.dashCooldown * p.dashCooldownMul;
   }
 
-  function spawnPoint() {
-    const margin = 40;
-    const side = random.int(0, 3);
-    if (side === 0) return { x: random.range(margin, FIELD.width - margin), y: -30 };
-    if (side === 1) return { x: random.range(margin, FIELD.width - margin), y: FIELD.height + 30 };
-    if (side === 2) return { x: -30, y: random.range(margin, FIELD.height - margin) };
-    return { x: FIELD.width + 30, y: random.range(margin, FIELD.height - margin) };
-  }
-
-  function spawnEnemy(kind) {
-    const def = ENEMY[kind];
-    const at = spawnPoint();
-    // Later waves hunt faster: up to +50% speed by wave 25.
-    const waveSpeed = 1 + Math.min(0.5, state.wave * 0.02);
-    const enemy = {
-      kind,
-      x: at.x,
-      y: at.y,
-      vx: 0,
-      vy: 0,
-      radius: def.radius,
-      hp: def.hp,
-      maxHp: def.hp,
-      speed: def.speed * random.range(0.9, 1.15) * waveSpeed,
-      score: def.score,
-      angle: 0,
-      wobble: random.range(0, TAU),
-      burstTimer: kind === 'dread' ? 2.5 : 0,
-      spitTimer: kind === 'spitter' ? 1.8 : 0,
-      flash: 0,
-    };
-    state.enemies.push(enemy);
-  }
-
-  function startWave() {
-    state.wave += 1;
-    state.waveActive = true;
-    spawnQueue = waveMix(state.wave);
-    spawnTimer = 0.4;
-    return EVENT_WAVE;
-  }
-
-  function burst(x, y, color, count, speed, life) {
-    for (let i = 0; i < count; i += 1) {
-      const angle = random.range(0, TAU);
-      const v = random.range(speed * 0.3, speed);
-      state.particles.push({
-        x, y,
-        vx: Math.cos(angle) * v,
-        vy: Math.sin(angle) * v,
-        radius: random.range(2, 5),
-        life: random.range(life * 0.5, life),
-        maxLife: life,
-        color,
+  // Fire: hold mouse. One bolt per shot, plus extra bolts from Twin Wick.
+  const interval = PLAYER.fireInterval / p.fireRateMul;
+  if (input.mouse.down && p.fireT <= 0) {
+    p.fireT = interval;
+    const n = p.shots;
+    const spread = 0.14;
+    for (let i = 0; i < n; i += 1) {
+      const off = (i - (n - 1) / 2) * spread;
+      w.bolts.push({
+        x: p.x + Math.cos(p.aim) * (p.radius + 6),
+        y: p.y + Math.sin(p.aim) * (p.radius + 6),
+        vx: Math.cos(p.aim + off) * PLAYER.boltSpeed,
+        vy: Math.sin(p.aim + off) * PLAYER.boltSpeed,
+        damage: PLAYER.boltDamage * p.damageMul,
+        frost: p.frost, life: 1.6, radius: 5,
       });
     }
+    w.nightShots += 1;
+    w.stats.shots += 1;
+    audio.play('shoot');
   }
 
-  function ring(x, y, color) {
-    state.particles.push({ x, y, vx: 0, vy: 0, radius: 6, life: 0.45, maxLife: 0.45, color, ring: true });
-  }
-
-  function floatText(x, y, text, color) {
-    state.texts.push({ x, y, text, color, life: 0.9, maxLife: 0.9 });
-  }
-
-  function dropPickup(x, y) {
-    if (!random.chance(PICKUP.dropChance)) return;
-    let kind = 'orb';
-    const roll = random.next();
-    if (roll < PICKUP.heartChance && state.player.hearts < PLAYER.maxHearts) kind = 'heart';
-    else if (roll < 0.35) kind = 'rapid';
-    else if (roll < 0.6) kind = 'spread';
-    else if (roll < 0.85) kind = 'shield';
-    state.pickups.push({ kind, x, y, vx: 0, vy: 0, life: PICKUP.lifetime, bob: random.range(0, TAU) });
-  }
-
-  function killEnemy(enemy, index) {
-    const player = state.player;
-    const inLight = dist2(enemy.x, enemy.y, player.x, player.y) <= player.lamp * player.lamp;
-    state.combo += 1;
-    state.comboTimer = COMBO.windowSeconds;
-    state.multiplier = Math.min(COMBO.maxMultiplier, 1 + Math.floor(state.combo / COMBO.stepKills));
-    const gained = enemy.score * state.multiplier * (inLight ? 1.5 : 1);
-    state.score += Math.round(gained);
-    state.kills += 1;
-    const def = ENEMY[enemy.kind];
-    burst(enemy.x, enemy.y, def.color, enemy.kind === 'dread' ? 42 : 16, 260, 0.6);
-    ring(enemy.x, enemy.y, def.color);
-    floatText(enemy.x, enemy.y - 18, `+${Math.round(gained)}`, inLight ? '#ffe9a8' : '#eaf6ff');
-    if (enemy.kind === 'gloom') {
-      for (let i = 0; i < 2; i += 1) {
-        state.enemies.push({
-          kind: 'wisp',
-          x: enemy.x + random.range(-24, 24),
-          y: enemy.y + random.range(-24, 24),
-          vx: 0, vy: 0,
-          radius: ENEMY.wisp.radius, hp: 1, maxHp: 1,
-          speed: ENEMY.wisp.speed * random.range(1, 1.3),
-          score: ENEMY.wisp.score, angle: 0,
-          wobble: random.range(0, TAU), burstTimer: 0, spitTimer: 0, flash: 0,
-        });
-      }
-    }
-    dropPickup(enemy.x, enemy.y);
-    state.enemies.splice(index, 1);
-  }
-
-  function hurtPlayer() {
-    const player = state.player;
-    if (player.invulnerable > 0 || player.dashTime > 0) return 0;
-    if (player.shieldTimer > 0) {
-      player.shieldTimer = 0;
-      player.invulnerable = 0.8;
-      ring(player.x, player.y, '#9df2ff');
-      floatText(player.x, player.y - 30, 'SHIELD!', '#9df2ff');
-      return EVENT_HIT;
-    }
-    player.hearts -= 1;
-    player.invulnerable = PLAYER.invulnerableTime;
-    state.combo = 0;
-    state.multiplier = 1;
-    state.shake = 14;
-    state.flash = 0.55;
-    burst(player.x, player.y, '#ff5d73', 24, 300, 0.7);
-    if (player.hearts <= 0) return EVENT_HIT | EVENT_OVER;
-    return EVENT_HIT;
-  }
-
-  /** A spitter's aimed bolt: one slow shot straight at the lantern,
-   * telegraphed by the burst it leaves at the maw. */
-  function spitAimedBolt(enemy) {
-    const a = angleTo(enemy.x, enemy.y, state.player.x, state.player.y);
-    state.enemyBullets.push({
-      x: enemy.x + Math.cos(a) * (enemy.radius + 6),
-      y: enemy.y + Math.sin(a) * (enemy.radius + 6),
-      vx: Math.cos(a) * 210,
-      vy: Math.sin(a) * 210,
-      radius: 6,
+  // Lance: F fires a piercing lance-bolt (4x damage, passes through foes),
+  // on a 3s cooldown. The HUD shows the cooldown.
+  if (w.lanceCd > 0) w.lanceCd -= dt;
+  if (input.pressed('KeyF') && w.lanceCd <= 0) {
+    w.lanceCd = 3;
+    w.bolts.push({
+      x: p.x + Math.cos(p.aim) * (p.radius + 6),
+      y: p.y + Math.sin(p.aim) * (p.radius + 6),
+      vx: Math.cos(p.aim) * 900,
+      vy: Math.sin(p.aim) * 900,
+      damage: PLAYER.boltDamage * p.damageMul * 4,
+      frost: p.frost, life: 1.2, radius: 8, pierce: true, hit: new Set(),
     });
-    burst(enemy.x, enemy.y, ENEMY.spitter.color, 4, 120, 0.3);
+    addFlash(w.fx, '#ffe9a8', 0.08);
+    audio.play('shoot');
   }
 
-  function stepPlayer(dt, move, aim, firing, dash) {
-    const player = state.player;
-    player.invulnerable = Math.max(0, player.invulnerable - dt);
-    player.dashCooldown = Math.max(0, player.dashCooldown - dt);
-    player.rapidTimer = Math.max(0, player.rapidTimer - dt);
-    player.spreadTimer = Math.max(0, player.spreadTimer - dt);
-    player.shieldTimer = Math.max(0, player.shieldTimer - dt);
-    player.fireTimer -= dt;
-    player.muzzle = Math.max(0, player.muzzle - dt);
-    player.wakeTimer -= dt;
-    player.lamp = Math.max(PLAYER.lampBase, player.lamp - PLAYER.lampDecay * dt);
-    player.angle = angleTo(player.x, player.y, aim.x, aim.y);
-
-    if (dash && player.dashCooldown <= 0 && (move.x !== 0 || move.y !== 0)) {
-      player.dashTime = PLAYER.dashTime;
-      player.dashCooldown = PLAYER.dashCooldown;
-      burst(player.x, player.y, '#ffe9a8', 10, 180, 0.4);
-    }
-
-    if (player.dashTime > 0) {
-      player.dashTime -= dt;
-      player.x += move.x * PLAYER.dashSpeed * dt;
-      player.y += move.y * PLAYER.dashSpeed * dt;
-    } else {
-      player.x += move.x * PLAYER.speed * dt;
-      player.y += move.y * PLAYER.speed * dt;
-    }
-    player.x = Math.min(FIELD.width - PLAYER.radius, Math.max(PLAYER.radius, player.x));
-    player.y = Math.min(FIELD.height - PLAYER.radius, Math.max(PLAYER.radius, player.y));
-
-    // A moving skiff leaves a fading wake on the tide.
-    if ((move.x !== 0 || move.y !== 0) && player.wakeTimer <= 0) {
-      player.wakeTimer = 0.06;
-      state.particles.push({
-        x: player.x - move.x * 20,
-        y: player.y - move.y * 20,
-        vx: -move.x * 30,
-        vy: -move.y * 30,
-        radius: 3,
-        life: 0.5,
-        maxLife: 0.5,
-        color: '#2f5d7d',
+  // Light-trap: right click (or E) drops a trap at the mouse, within the arena.
+  if ((input.mouse.rightPressed || input.pressed('KeyE')) && p.trapCd <= 0) {
+    const live = w.traps.filter((t) => t.life > 0).length;
+    if (live < p.trapSlots) {
+      w.traps.push({
+        x: clamp(input.mouse.x, ARENA.x + 20, ARENA.x + ARENA.w - 20),
+        y: clamp(input.mouse.y, ARENA.y + 20, ARENA.y + ARENA.h - 20),
+        radius: PLAYER.trapRadius, damage: PLAYER.trapDamage, life: PLAYER.trapDuration,
+        maxLife: PLAYER.trapDuration, tickT: 0,
       });
-    }
-
-    if (firing && player.fireTimer <= 0) {
-      player.fireTimer = player.rapidTimer > 0 ? PLAYER.rapidInterval : PLAYER.fireInterval;
-      player.muzzle = 0.07;
-      const angles = player.spreadTimer > 0 ? [-0.22, 0, 0.22] : [0];
-      for (const offset of angles) {
-        const a = player.angle + offset;
-        state.bullets.push({
-          x: player.x + Math.cos(a) * (PLAYER.radius + 8),
-          y: player.y + Math.sin(a) * (PLAYER.radius + 8),
-          vx: Math.cos(a) * PLAYER.bulletSpeed,
-          vy: Math.sin(a) * PLAYER.bulletSpeed,
-          radius: PLAYER.bulletRadius,
-          damage: 1,
-        });
-      }
-      state.shotsFired += 1;
+      p.trapCd = 0.4;
+      audio.play('trap');
+    } else {
+      audio.play('deny');
     }
   }
 
-  function stepEnemies(dt) {
-    const player = state.player;
-    for (let i = state.enemies.length - 1; i >= 0; i -= 1) {
-      const enemy = state.enemies[i];
-      enemy.flash = Math.max(0, enemy.flash - dt);
-      const angle = angleTo(enemy.x, enemy.y, player.x, player.y);
-      enemy.angle = angle;
-      let vx = Math.cos(angle) * enemy.speed;
-      let vy = Math.sin(angle) * enemy.speed;
-      if (enemy.kind === 'shade') {
-        enemy.wobble += dt * 6;
-        const perp = angle + Math.PI / 2;
-        vx += Math.cos(perp) * Math.sin(enemy.wobble) * 120;
-        vy += Math.sin(perp) * Math.sin(enemy.wobble) * 120;
-      }
-      if (enemy.kind === 'spitter') {
-        // Hold a firing lane: close in past 320, back off inside 220,
-        // strafe while the maw charges, then spit an aimed bolt.
-        enemy.wobble += dt * 2;
-        const d = Math.sqrt(dist2(enemy.x, enemy.y, player.x, player.y)) || 1;
-        const hold = d > 320 ? 1 : d < 220 ? -0.8 : 0;
-        const perp = angle + Math.PI / 2;
-        vx = Math.cos(angle) * enemy.speed * hold + Math.cos(perp) * Math.sin(enemy.wobble) * 60;
-        vy = Math.sin(angle) * enemy.speed * hold + Math.sin(perp) * Math.sin(enemy.wobble) * 60;
-        enemy.spitTimer -= dt;
-        if (enemy.spitTimer <= 0) {
-          enemy.spitTimer = 3.0;
-          spitAimedBolt(enemy);
-        }
-      }
-      if (enemy.kind === 'dread') {
-        enemy.burstTimer -= dt;
-        if (enemy.burstTimer <= 0) {
-          enemy.burstTimer = 2.6;
-          for (let k = 0; k < 8; k += 1) {
-            const a = (k / 8) * TAU + enemy.wobble;
-            state.enemyBullets.push({
-              x: enemy.x + Math.cos(a) * (enemy.radius + 6),
-              y: enemy.y + Math.sin(a) * (enemy.radius + 6),
-              vx: Math.cos(a) * 190,
-              vy: Math.sin(a) * 190,
-              radius: 7,
-            });
-          }
-          ring(enemy.x, enemy.y, ENEMY.dread.color);
-        }
-      }
-      enemy.x += vx * dt;
-      enemy.y += vy * dt;
-      // Touching the lantern hurts.
-      const rr = enemy.radius + PLAYER.radius - 4;
-      if (dist2(enemy.x, enemy.y, player.x, player.y) < rr * rr) {
-        const events = hurtPlayer();
-        if (events & EVENT_OVER) return events;
-        // The enemy that landed the hit is spent.
-        burst(enemy.x, enemy.y, ENEMY[enemy.kind].color, 10, 200, 0.5);
-        state.enemies.splice(i, 1);
-      }
-    }
-    return 0;
+  // Flame drains the whole night. Out of flame, the run ends.
+  // Lantern Oil slows the drain by 20%.
+  const drain = w.diff.flameDrain * (w.boss ? 1.15 : 1) * (p.oil ? 0.8 : 1);
+  p.flame -= drain * dt;
+  if (p.flame <= 0) {
+    p.flame = 0;
+    killPlayer(w, 'The flame went out.', audio);
   }
 
-  function stepBullets(dt) {
-    let events = 0;
-    for (let i = state.bullets.length - 1; i >= 0; i -= 1) {
-      const bullet = state.bullets[i];
-      bullet.x += bullet.vx * dt;
-      bullet.y += bullet.vy * dt;
-      if (bullet.x < -20 || bullet.x > FIELD.width + 20 || bullet.y < -20 || bullet.y > FIELD.height + 20) {
-        state.bullets.splice(i, 1);
-        continue;
+  // Pickups: embers (currency) and flame motes drift to the Keeper.
+  const magnet = PLAYER.magnetRadius * p.magnetMul;
+  for (const pk of w.pickups) {
+    pk.t -= dt;
+    const d = dist(pk.x, pk.y, p.x, p.y);
+    if (d < magnet) {
+      const pull = 420 * (1 - d / magnet) + 120;
+      const a = angleTo(pk.x, pk.y, p.x, p.y);
+      pk.x += Math.cos(a) * pull * dt;
+      pk.y += Math.sin(a) * pull * dt;
+    }
+    if (d < p.radius + PLAYER.pickupRadius) {
+      pk.dead = true;
+      if (pk.kind === 'ember') {
+        const gain = Math.round(EMBERS_PER_KILL * w.diff.emberMul * p.emberMul);
+        w.embers += gain;
+        w.stats.embersEarned += gain;
+        if (w.embers >= 300) unlockFeat(w, 'hoarder');
+      } else {
+        p.flame = Math.min(p.maxFlame, p.flame + FLAME_PER_KILL);
+        audio.play('pickup');
       }
-      for (let j = state.enemies.length - 1; j >= 0; j -= 1) {
-        const enemy = state.enemies[j];
-        const rr = enemy.radius + bullet.radius;
-        if (dist2(bullet.x, bullet.y, enemy.x, enemy.y) < rr * rr) {
-          state.bullets.splice(i, 1);
-          state.shotsHit += 1;
-          enemy.hp -= bullet.damage;
-          enemy.flash = 0.12;
-          burst(bullet.x, bullet.y, ENEMY[enemy.kind].color, 5, 160, 0.35);
-          if (enemy.hp <= 0) {
-            killEnemy(enemy, j);
-            events |= EVENT_KILL;
-          }
+    }
+  }
+  w.pickups = w.pickups.filter((pk) => !pk.dead && pk.t > 0);
+}
+
+export function hurtPlayer(w, amount, audio) {
+  const p = w.player;
+  if (p.invulnT > 0 || w.screen !== 'playing') return;
+  // Ember Shield blocks one hit per night.
+  if (p.shield) {
+    p.shield = false;
+    p.invulnT = 1.0;
+    addFloat(w, p.x, p.y - 24, 'SHIELD!', '#7fd4ff');
+    spawnParticles(w, p.x, p.y, 10, '#7fd4ff', 180, 0.4);
+    audio.play('deny');
+    return;
+  }
+  p.hearts -= amount;
+  p.invulnT = 1.0;
+  w.nightDamage = true;
+  audio.play('hurt');
+  addShake(w.fx, 10);
+  addFlash(w.fx, '#ff3b30', 0.12);
+  spawnParticles(w, p.x, p.y, 14, '#ff6b5e', 220, 0.5);
+  addFloat(w, p.x, p.y - 24, `-${amount} ♥`, '#ff6b5e');
+  if (p.hearts <= 0) killPlayer(w, 'The Keeper has fallen.', audio);
+}
+
+export function killPlayer(w, why, audio) {
+  const p = w.player;
+  if (p.phoenix > 0) {
+    p.phoenix -= 1;
+    p.hearts = 2;
+    p.flame = p.maxFlame * 0.5;
+    p.invulnT = 2;
+    w.message = 'The Phoenix Feather burns — you rise again!';
+    w.messageT = 3;
+    audio.play('relic');
+    spawnParticles(w, p.x, p.y, 40, '#ffb347', 320, 0.9);
+    return;
+  }
+  w.screen = 'gameover';
+  w.over = { why, night: w.night, score: w.score };
+  audio.play('gameOver');
+  finishRun(w, false, audio);
+}
+
+// ---------------------------------------------------------------------------
+// Particles and floating text (visual only, but seeded through the world rng).
+// ---------------------------------------------------------------------------
+export function spawnParticles(w, x, y, n, color, speed, life) {
+  for (let i = 0; i < n; i += 1) {
+    const a = w.rng() * Math.PI * 2;
+    const s = speed * (0.4 + w.rng() * 0.8);
+    w.particles.push({
+      x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      life: life * (0.6 + w.rng() * 0.7), maxLife: life, color,
+      size: 2 + w.rng() * 3,
+    });
+  }
+}
+
+export function addFloat(w, x, y, text, color) {
+  w.floats.push({ x, y, text, color, life: 1.1, maxLife: 1.1 });
+}
+
+export function updateParticles(w, dt) {
+  for (const pt of w.particles) {
+    pt.x += pt.vx * dt;
+    pt.y += pt.vy * dt;
+    pt.vx *= 0.94;
+    pt.vy *= 0.94;
+    pt.life -= dt;
+  }
+  w.particles = w.particles.filter((pt) => pt.life > 0);
+  for (const f of w.floats) {
+    f.y -= 34 * dt;
+    f.life -= dt;
+  }
+  w.floats = w.floats.filter((f) => f.life > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Enemies: movement per behaviour, and their attacks.
+// ---------------------------------------------------------------------------
+export function updateEnemies(w, dt, audio) {
+  const p = w.player;
+  for (const e of w.enemies) {
+    e.t += dt;
+    if (e.flashT > 0) e.flashT -= dt;
+    if (e.slowT > 0) e.slowT -= dt;
+    const slow = e.slowT > 0 ? 0.7 : 1;
+    const toPlayer = angleTo(e.x, e.y, p.x, p.y);
+    const dPlayer = dist(e.x, e.y, p.x, p.y);
+
+    if (e.behaviour === 'drift') {
+      e.wobble += dt * 2.2;
+      const a = toPlayer + Math.sin(e.wobble) * 0.5;
+      e.x += Math.cos(a) * e.speed * slow * dt;
+      e.y += Math.sin(a) * e.speed * slow * dt;
+    } else if (e.behaviour === 'chase' || e.behaviour === 'split') {
+      e.x += Math.cos(toPlayer) * e.speed * slow * dt;
+      e.y += Math.sin(toPlayer) * e.speed * slow * dt;
+    } else if (e.behaviour === 'zigzag') {
+      const perp = toPlayer + Math.PI / 2;
+      const sway = Math.sin(e.t * 4.2) * 0.8;
+      e.x += (Math.cos(toPlayer) + Math.cos(perp) * sway) * e.speed * slow * dt;
+      e.y += (Math.sin(toPlayer) + Math.sin(perp) * sway) * e.speed * slow * dt;
+    } else if (e.behaviour === 'ranged') {
+      // Hold ~260 away; spit a globe every couple of seconds.
+      if (dPlayer > 300) {
+        e.x += Math.cos(toPlayer) * e.speed * slow * dt;
+        e.y += Math.sin(toPlayer) * e.speed * slow * dt;
+      } else if (dPlayer < 200) {
+        e.x -= Math.cos(toPlayer) * e.speed * slow * dt;
+        e.y -= Math.sin(toPlayer) * e.speed * slow * dt;
+      }
+      e.fireT -= dt;
+      if (e.fireT <= 0 && dPlayer < 520) {
+        e.fireT = 2.2 + w.rng() * 0.8;
+        fireEnemyBullet(w, e.x, e.y, toPlayer, 170, 6, '#e07fd4');
+      }
+    } else if (e.behaviour === 'phase') {
+      // Solid 2.2s, faded 1.4s. Only solid takes damage; faster while faded.
+      e.phaseT += dt;
+      const cycle = e.phaseT % 3.6;
+      e.solid = cycle < 2.2;
+      const sp = e.solid ? e.speed : e.speed * 1.6;
+      e.x += Math.cos(toPlayer) * sp * slow * dt;
+      e.y += Math.sin(toPlayer) * sp * slow * dt;
+    } else if (e.behaviour === 'charge') {
+      if (e.telegraph > 0) {
+        e.telegraph -= dt;
+        if (e.telegraph <= 0) {
+          e.charging = 0.7;
+          e.chargeDir = toPlayer;
+          audio.play('dash');
+        }
+      } else if (e.charging > 0) {
+        e.charging -= dt;
+        e.x += Math.cos(e.chargeDir) * 430 * slow * dt;
+        e.y += Math.sin(e.chargeDir) * 430 * slow * dt;
+        spawnParticles(w, e.x, e.y, 1, '#ff6b5e', 60, 0.3);
+      } else {
+        e.x += Math.cos(toPlayer) * e.speed * slow * dt;
+        e.y += Math.sin(toPlayer) * e.speed * slow * dt;
+        e.chargeT -= dt;
+        if (e.chargeT <= 0 && dPlayer < 420) {
+          e.telegraph = 0.8;
+          e.chargeT = 4.5 + w.rng() * 1.5;
+        }
+      }
+    } else if (e.behaviour === 'drain') {
+      // Keep ~300 away and drink the flame.
+      if (dPlayer > 340) {
+        e.x += Math.cos(toPlayer) * e.speed * slow * dt;
+        e.y += Math.sin(toPlayer) * e.speed * slow * dt;
+      } else if (dPlayer < 240) {
+        e.x -= Math.cos(toPlayer) * e.speed * slow * dt;
+        e.y -= Math.sin(toPlayer) * e.speed * slow * dt;
+      }
+      if (dPlayer < 360) {
+        p.flame = Math.max(0, p.flame - 1.5 * dt);
+        if (w.rng() < dt * 8) spawnParticles(w, e.x, e.y, 1, '#4fd4c2', 40, 0.4);
+        if (p.flame <= 0) killPlayer(w, 'The flame was drunk dry.', audio);
+      }
+    }
+
+    e.x = clamp(e.x, ARENA.x + e.radius, ARENA.x + ARENA.w - e.radius);
+    e.y = clamp(e.y, ARENA.y + e.radius, ARENA.y + ARENA.h - e.radius);
+    e.angle = toPlayer;
+
+    // Touch damage (thorns strike back first).
+    if (dPlayer < e.radius + p.radius && p.invulnT <= 0 && p.dashT <= 0) {
+      if (p.thorns > 0) damageEnemy(w, e, p.thorns, audio, true);
+      hurtPlayer(w, e.damage, audio);
+    }
+  }
+  w.enemies = w.enemies.filter((e) => e.hp > 0);
+}
+
+export function fireEnemyBullet(w, x, y, angle, speed, radius, color) {
+  w.ebullets.push({
+    x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+    radius, color, life: 5,
+  });
+}
+
+export function updateBullets(w, dt, audio) {
+  // Player bolts.
+  for (const b of w.bolts) {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    if (b.x < ARENA.x || b.x > ARENA.x + ARENA.w || b.y < ARENA.y || b.y > ARENA.y + ARENA.h) b.life = 0;
+  }
+  // Enemy globes.
+  for (const b of w.ebullets) {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    if (b.x < ARENA.x || b.x > ARENA.x + ARENA.w || b.y < ARENA.y || b.y > ARENA.y + ARENA.h) b.life = 0;
+    const p = w.player;
+    if (dist(b.x, b.y, p.x, p.y) < b.radius + p.radius) {
+      b.life = 0;
+      hurtPlayer(w, 1, audio);
+    }
+  }
+  w.bolts = w.bolts.filter((b) => b.life > 0);
+  w.ebullets = w.ebullets.filter((b) => b.life > 0);
+}
+
+export function rollBoltDamage(w, b) {
+  // Lucky Candle: 15% of bolts deal triple damage.
+  if (w.player.lucky && w.rng() < 0.15) {
+    addFloat(w, b.x, b.y - 12, 'CRIT!', '#ffd94f');
+    return b.damage * 3;
+  }
+  return b.damage;
+}
+
+export function resolveBoltHits(w, audio) {
+  const p = w.player;
+  for (const b of w.bolts) {
+    if (b.life <= 0) continue;
+    // Boss first (it is big and in the way).
+    if (w.boss && w.boss.hp > 0 && dist(b.x, b.y, w.boss.x, w.boss.y) < b.radius + w.boss.radius) {
+      if (b.pierce) {
+        if (!b.hit.has(w.boss)) {
+          b.hit.add(w.boss);
+          w.stats.lanceHits += 1;
+          if (w.stats.lanceHits >= 25) unlockFeat(w, 'lanceMaster');
+          damageBoss(w, rollBoltDamage(w, b), audio);
+          w.nightHits += 1;
+          w.stats.hits += 1;
+        }
+      } else {
+        b.life = 0;
+        damageBoss(w, rollBoltDamage(w, b), audio);
+        w.nightHits += 1;
+        w.stats.hits += 1;
+      }
+      continue;
+    }
+    for (const e of w.enemies) {
+      if (e.hp <= 0) continue;
+      if (e.behaviour === 'phase' && !e.solid) continue;
+      if (dist(b.x, b.y, e.x, e.y) < b.radius + e.radius) {
+        if (b.pierce) {
+          if (b.hit.has(e)) continue;
+          b.hit.add(e);
+          w.stats.lanceHits += 1;
+          if (w.stats.lanceHits >= 25) unlockFeat(w, 'lanceMaster');
+          damageEnemy(w, e, rollBoltDamage(w, b), audio, false, b.frost);
+          w.nightHits += 1;
+          w.stats.hits += 1;
+          continue;
+        }
+        b.life = 0;
+        damageEnemy(w, e, rollBoltDamage(w, b), audio, false, b.frost);
+        w.nightHits += 1;
+        w.stats.hits += 1;
+        break;
+      }
+    }
+  }
+  // Traps tick: damage anything standing in them.
+  for (const t of w.traps) {
+    t.life -= 1 / 60;
+    t.tickT -= 1 / 60;
+    if (t.tickT <= 0) {
+      t.tickT = 0.5;
+      for (const e of w.enemies) {
+        if (e.hp > 0 && dist(t.x, t.y, e.x, e.y) < t.radius + e.radius) damageEnemy(w, e, t.damage, audio, true);
+      }
+      if (w.boss && w.boss.hp > 0 && dist(t.x, t.y, w.boss.x, w.boss.y) < t.radius + w.boss.radius) {
+        damageBoss(w, t.damage, audio);
+      }
+    }
+  }
+  w.traps = w.traps.filter((t) => t.life > 0);
+}
+
+export function damageEnemy(w, e, dmg, audio, silent, frost) {
+  e.hp -= dmg;
+  e.flashT = 0.12;
+  if (frost) e.slowT = 1.5;
+  if (!silent) audio.play('hit');
+  spawnParticles(w, e.x, e.y, 4, e.color, 140, 0.3);
+  if (e.hp <= 0) killEnemy(w, e, audio);
+}
+
+export function killEnemy(w, e, audio) {
+  const p = w.player;
+  // Combo: kills within 3s of each other raise a multiplier (up to x2).
+  w.combo.count += 1;
+  w.combo.timer = 3;
+  const mult = 1 + Math.min(w.combo.count, 10) * 0.1;
+  if (mult >= 2.0) unlockFeat(w, 'comboKing');
+  const gain = Math.round(e.value * w.diff.scoreMul * mult);
+  w.score += gain;
+  w.nightKills += 1;
+  w.stats.kills += 1;
+  if (e.elite) {
+    w.stats.elitesKilled += 1;
+    if (w.stats.elitesKilled >= 5) unlockFeat(w, 'eliteHunter');
+  }
+  if (p.secondWind) p.dashCharges = p.dashMax;
+  addFloat(w, e.x, e.y - 14, mult > 1 ? `+${gain} ×${mult.toFixed(1)}` : `+${gain}`, '#ffd94f');
+  spawnParticles(w, e.x, e.y, 12, e.color, 200, 0.5);
+  audio.play('die');
+  // Drops: a flame mote, and sometimes an ember coin.
+  w.pickups.push({ kind: 'flame', x: e.x, y: e.y, t: 8 });
+  if (w.rng() < 0.55) w.pickups.push({ kind: 'ember', x: e.x + (w.rng() - 0.5) * 30, y: e.y + (w.rng() - 0.5) * 30, t: 8 });
+  if (e.type === 'splitter') {
+    spawnEnemy(w, 'mote', e.x - 14, e.y);
+    spawnEnemy(w, 'mote', e.x + 14, e.y);
+  }
+  if (p.blast) {
+    for (const o of w.enemies) {
+      if (o !== e && o.hp > 0 && dist(o.x, o.y, e.x, e.y) < 110) damageEnemy(w, o, 2, audio, true);
+    }
+    spawnParticles(w, e.x, e.y, 10, '#ffb347', 260, 0.4);
+  }
+  // Triple-kill feat: 3 kills inside 2 seconds.
+  const now = w.time;
+  w.killsWindow.push(now);
+  w.killsWindow = w.killsWindow.filter((t) => now - t < 2);
+  if (w.killsWindow.length >= 3) unlockFeat(w, 'tripleKill');
+}
+
+// ---------------------------------------------------------------------------
+// Bosses: movement and attacks per boss id, with phase changes.
+// ---------------------------------------------------------------------------
+export function updateBoss(w, dt, audio) {
+  const b = w.boss;
+  if (!b || b.hp <= 0) return;
+  const p = w.player;
+  b.t += dt;
+  if (b.flashT > 0) b.flashT -= dt;
+  if (b.slowT > 0) b.slowT -= dt;
+  // Enrage: after 75 seconds the boss burns hotter and attacks faster.
+  const enraged = b.t > BOSS_ENRAGE_TIME;
+  const rate = enraged ? BOSS_ENRAGE_MUL : 1;
+  if (enraged && !b.enraged) {
+    b.enraged = true;
+    w.message = `${b.name} is ENRAGED!`;
+    w.messageT = 3;
+    addShake(w.fx, 12);
+  }
+  const toPlayer = angleTo(b.x, b.y, p.x, p.y);
+  const dPlayer = dist(b.x, b.y, p.x, p.y);
+  const slow = b.slowT > 0 ? 0.7 : 1;
+
+  // Phase changes announce themselves.
+  const frac = b.hp / b.maxHp;
+  while (b.phaseIdx < b.phases.length - 1 && frac <= b.phases[b.phaseIdx + 1].at) {
+    b.phaseIdx += 1;
+    w.message = b.phases[b.phaseIdx].note;
+    w.messageT = 2.5;
+    if (b.id !== 'drownedBell') radialBurst(w, b.x, b.y, 12, 150);
+    audio.play('bossRoar');
+  }
+
+  if (b.id === 'drownedBell') {
+    b.x += Math.cos(toPlayer) * b.speed * slow * dt;
+    b.y += Math.sin(toPlayer) * b.speed * slow * dt;
+    b.burstT -= dt;
+    if (b.burstT <= 0) {
+      b.burstT = (b.phaseIdx === 0 ? 3.6 : 2.6) * rate;
+      radialBurst(w, b.x, b.y, 10, 150);
+      audio.play('bossRoar');
+    }
+    b.summonT -= dt;
+    if (b.summonT <= 0) {
+      b.summonT = 6 * rate;
+      for (let i = 0; i < 4; i += 1) spawnEnemy(w, 'mote');
+      w.message = 'The Bell tolls — the drowned rise!';
+      w.messageT = 2;
+    }
+  } else if (b.id === 'ashenStag') {
+    if (b.chargeState === 1) {
+      b.chargeT -= dt;
+      if (b.chargeT <= 0) {
+        b.chargeState = 2;
+        b.chargeDir = toPlayer;
+        b.chargeT = 0.8;
+        audio.play('dash');
+      }
+    } else if (b.chargeState === 2) {
+      b.chargeT -= dt;
+      b.x += Math.cos(b.chargeDir) * 470 * slow * dt;
+      b.y += Math.sin(b.chargeDir) * 470 * slow * dt;
+      spawnParticles(w, b.x, b.y, 2, '#ff9d4f', 120, 0.3);
+      if (b.chargeT <= 0) { b.chargeState = 0; b.chargeT = (5 + w.rng() * 2) * rate; }
+    } else {
+      b.x += Math.cos(toPlayer) * b.speed * slow * dt;
+      b.y += Math.sin(toPlayer) * b.speed * slow * dt;
+      b.chargeT -= dt;
+      if (b.chargeT <= 0 && dPlayer < 460) { b.chargeState = 1; b.chargeT = 0.9; }
+    }
+    b.summonT -= dt;
+    if (b.summonT <= 0) {
+      b.summonT = 7 * rate;
+      for (let i = 0; i < 3; i += 1) spawnEnemy(w, 'crawler');
+    }
+  } else if (b.id === 'eclipseWarden') {
+    b.x += Math.cos(toPlayer) * b.speed * slow * dt;
+    b.y += Math.sin(toPlayer) * b.speed * slow * dt;
+    b.burstT -= dt;
+    if (b.burstT <= 0) {
+      b.burstT = 4 * rate;
+      radialBurst(w, b.x, b.y, 14, 165);
+      radialBurst(w, b.x, b.y, 14, 165, Math.PI / 14);
+    }
+    b.summonT -= dt;
+    if (b.summonT <= 0) {
+      b.summonT = 8 * rate;
+      for (let i = 0; i < 3; i += 1) spawnEnemy(w, 'wraith');
+      w.message = 'The Warden calls the wraiths!';
+      w.messageT = 2;
+    }
+    // Drain aura: standing close drinks the flame.
+    if (dPlayer < 230) {
+      p.flame = Math.max(0, p.flame - 2 * dt);
+      if (w.rng() < dt * 10) spawnParticles(w, p.x, p.y, 1, '#c9a7ff', 60, 0.4);
+      if (p.flame <= 0) killPlayer(w, 'The Warden drank the last light.', audio);
+    }
+    // Charge slam.
+    if (b.chargeState === 1) {
+      b.chargeT -= dt;
+      if (b.chargeT <= 0) {
+        b.chargeState = 2;
+        b.chargeDir = toPlayer;
+        b.chargeT = 0.7;
+      }
+    } else if (b.chargeState === 2) {
+      b.chargeT -= dt;
+      b.x += Math.cos(b.chargeDir) * 500 * slow * dt;
+      b.y += Math.sin(b.chargeDir) * 500 * slow * dt;
+      if (b.chargeT <= 0) { b.chargeState = 0; b.chargeT = 8 + w.rng() * 2; }
+    } else {
+      b.chargeT -= dt;
+      if (b.chargeT <= 0 && dPlayer < 480) { b.chargeState = 1; b.chargeT = 0.9; }
+    }
+  }
+
+  b.x = clamp(b.x, ARENA.x + b.radius, ARENA.x + ARENA.w - b.radius);
+  b.y = clamp(b.y, ARENA.y + b.radius, ARENA.y + ARENA.h - b.radius);
+  b.angle = toPlayer;
+
+  // Touch damage.
+  if (dPlayer < b.radius + p.radius && p.invulnT <= 0 && p.dashT <= 0) {
+    if (p.thorns > 0) damageBoss(w, p.thorns, audio);
+    hurtPlayer(w, 2, audio);
+  }
+}
+
+function radialBurst(w, x, y, n, speed, offset = 0) {
+  for (let i = 0; i < n; i += 1) {
+    const a = offset + (i / n) * Math.PI * 2;
+    fireEnemyBullet(w, x, y, a, speed, 8, '#c9a7ff');
+  }
+}
+
+export function damageBoss(w, dmg, audio) {
+  const b = w.boss;
+  if (!b || b.hp <= 0) return;
+  b.hp -= dmg;
+  b.flashT = 0.1;
+  if (b.hp <= 0) {
+    b.hp = 0;
+    w.score += Math.round(b.value * w.diff.scoreMul) + BOSS_BONUS;
+    w.stats.bosses += 1;
+    addFloat(w, b.x, b.y - 50, `+${Math.round(b.value * w.diff.scoreMul) + BOSS_BONUS}`, '#ffd94f');
+    spawnParticles(w, b.x, b.y, 60, b.color, 340, 1.0);
+    spawnParticles(w, b.x, b.y, 30, '#ffd94f', 260, 0.9);
+    burst(w.fx, w.rng, b.x, b.y, 40, b.color, 320, 1.0);
+    addShake(w.fx, 16);
+    addHitStop(w.fx, 0.22);
+    addFlash(w.fx, '#ffd94f', 0.25);
+    audio.play('bossDie');
+    unlockFeat(w, 'bossSlayer');
+    w.message = `${b.name} has fallen!`;
+    w.messageT = 3;
+  } else {
+    audio.play('hit');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Night flow: spawn queue, clear, intermission, relics, shop.
+// ---------------------------------------------------------------------------
+export function updateSpawning(w, dt) {
+  if (w.introT > 0) return; // let the banner breathe before the first spawn
+  if (w.spawnQueue.length > 0) {
+    w.spawnTimer -= dt;
+    if (w.spawnTimer <= 0) {
+      w.spawnTimer = NIGHT_PLANS[w.night - 1].pace / w.diff.spawnMul;
+      // Telegraph first: a warning mark at the edge, then the foe arrives.
+      const pos = pickEdge(w);
+      w.telegraphs.push({ type: w.spawnQueue.shift(), x: pos.x, y: pos.y, t: 0.6, maxT: 0.6 });
+    }
+  } else if (!w.bossSpawned) {
+    const plan = NIGHT_PLANS[w.night - 1];
+    if (plan.boss && w.enemies.length === 0) {
+      spawnBoss(w, plan.boss);
+    }
+  }
+}
+
+export function updateTelegraphs(w, dt) {
+  for (const tg of w.telegraphs) {
+    tg.t -= dt;
+    if (tg.t <= 0 && !tg.done) {
+      tg.done = true;
+      spawnEnemy(w, tg.type, tg.x, tg.y);
+    }
+  }
+  w.telegraphs = w.telegraphs.filter((tg) => !tg.done);
+}
+
+export function nightIsClear(w) {
+  if (w.introT > 0) return false;
+  if (w.spawnQueue.length > 0) return false;
+  if (w.enemies.length > 0) return false;
+  if (w.boss && w.boss.hp > 0) return false;
+  if (w.bossSpawned && w.boss) return true;
+  if (!NIGHT_PLANS[w.night - 1].boss) return true;
+  return false;
+}
+
+export function clearNight(w, audio) {
+  const p = w.player;
+  const bonus = NIGHT_CLEAR_BONUS * w.night + Math.round(p.flame) * 2;
+  const gained = Math.round(bonus * w.diff.scoreMul);
+  w.score += gained;
+  w.stats.nightsCleared += 1;
+  const acc = w.nightShots > 0 ? Math.round((w.nightHits / w.nightShots) * 100) : 0;
+  w.nightStats.push({ night: w.night, kills: w.nightKills, score: gained, accuracy: acc, flame: Math.round(p.flame) });
+  audio.play('nightClear');
+  burst(w.fx, w.rng, VIEW.W / 2, 200, 60, '#ffd94f', 300, 1.2);
+  addFlash(w.fx, '#ffe9a8', 0.15);
+  if (!w.nightDamage) unlockFeat(w, 'flawless');
+  if (p.flame >= p.maxFlame - 0.5) unlockFeat(w, 'fullFlame');
+  if (p.hearts === 1) unlockFeat(w, 'lastStand');
+  if (w.nightShots === 0) unlockFeat(w, 'pacifistFlame');
+  if (w.nightShots >= 10 && acc >= 80) unlockFeat(w, 'sharpshooter');
+  if (w.night === 1) unlockFeat(w, 'firstDawn');
+  if (w.night >= FINAL_NIGHT) {
+    finishRun(w, true, audio);
+    return;
+  }
+  openIntermission(w);
+}
+
+export function openIntermission(w) {
+  w.screen = 'intermission';
+  w.relicChoices = rollRelicChoices(w);
+  w.shop.forEach((s) => { s.bought = 0; });
+}
+
+export function rollRelicChoices(w) {
+  const pool = shuffle(w.rng, RELICS);
+  return pool.slice(0, 3);
+}
+
+export function chooseRelic(w, idx, audio) {
+  const relic = w.relicChoices[idx];
+  if (!relic) return false;
+  relic.apply(w.player);
+  w.relics.push(relic);
+  w.relicCounts[relic.id] = (w.relicCounts[relic.id] || 0) + 1;
+  w.stats.relicsTaken += 1;
+  if (w.relics.length >= 6) unlockFeat(w, 'fullArsenal');
+  w.relicChoices = [];
+  audio.play('relic');
+  return true;
+}
+
+export function buyShopItem(w, idx, audio) {
+  const item = w.shop[idx];
+  if (!item || w.embers < item.cost) { audio.play('deny'); return false; }
+  w.embers -= item.cost;
+  item.bought += 1;
+  item.apply(w.player);
+  audio.play('buy');
+  return true;
+}
+
+export function rerollRelics(w, audio) {
+  if (w.embers < REROLL_COST || w.relicChoices.length === 0) { audio.play('deny'); return false; }
+  w.embers -= REROLL_COST;
+  w.relicChoices = rollRelicChoices(w);
+  audio.play('click');
+  return true;
+}
+
+// Ember Market extras: rest (heal + refill) and gamble (a random relic).
+export function restAtMarket(w, audio) {
+  if (w.embers < REST_COST) { audio.play('deny'); return false; }
+  w.embers -= REST_COST;
+  w.player.hearts = Math.min(w.player.maxHearts, w.player.hearts + 1);
+  w.player.flame = w.player.maxFlame;
+  audio.play('heal');
+  return true;
+}
+
+export function gambleRelic(w, audio) {
+  if (w.embers < GAMBLE_COST) { audio.play('deny'); return false; }
+  w.embers -= GAMBLE_COST;
+  const relic = RELICS[Math.floor(w.rng() * RELICS.length)];
+  relic.apply(w.player);
+  w.relics.push(relic);
+  w.relicCounts[relic.id] = (w.relicCounts[relic.id] || 0) + 1;
+  w.stats.relicsTaken += 1;
+  if (w.relics.length >= 6) unlockFeat(w, 'fullArsenal');
+  w.message = `The market gives you: ${relic.name}!`;
+  w.messageT = 3;
+  audio.play('relic');
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Feats and run finish.
+// ---------------------------------------------------------------------------
+export function unlockFeat(w, id) {
+  if (w.feats.has(id)) return;
+  w.feats.add(id);
+  const feat = FEATS.find((f) => f.id === id);
+  w.featsNew.push(feat ? feat.name : id);
+  w.message = `Feat unlocked: ${feat ? feat.name : id}`;
+  w.messageT = 3;
+}
+
+export function finishRun(w, won, audio) {
+  const p = w.player;
+  const grade = gradeFor(w.score);
+  const record = {
+    seed: w.seed, difficulty: w.diff.id, score: w.score, grade: grade.grade,
+    nights: won ? NIGHTS : w.night, won,
+    kills: w.stats.kills, timeSec: Math.round(w.runTime),
+    date: new Date().toISOString().slice(0, 10),
+  };
+  saveRun(record);
+  w.history = loadHistory();
+  w.best = loadBest();
+  if (won) {
+    w.screen = 'victory';
+    w.victory = { grade, record, feats: [...w.feats] };
+    if (w.runTime < 20 * 60) unlockFeat(w, 'speedrun');
+    audio.play('victory');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level update: dispatch by screen, handle menus, pause, mute.
+// ---------------------------------------------------------------------------
+export function update(w, dt, input, audio) {
+  w.time += dt;
+  if (w.messageT > 0) w.messageT -= dt;
+  updateEffects(w.fx, dt, w.rng);
+  maybeLightning(w.fx, w.rng, dt, w.realm);
+  if (input.pressed('KeyM')) {
+    const muted = audio.toggleMute();
+    w.message = muted ? 'Sound off (M to turn on)' : 'Sound on';
+    w.messageT = 1.5;
+  }
+
+  if (w.screen === 'title') {
+    updateTitle(w, input, audio);
+    return;
+  }
+  if (w.screen === 'codex') {
+    updateCodex(w, input, audio);
+    return;
+  }
+  if (w.screen === 'intermission') {
+    updateIntermission(w, input, audio);
+    return;
+  }
+  if (w.screen === 'gameover' || w.screen === 'victory') {
+    if (input.pressed('Enter') || input.pressed('Space')) {
+      resetToTitle(w);
+    }
+    handleClick(w, input, audio);
+    return;
+  }
+  if (w.screen !== 'playing') return;
+
+  if (input.pressed('KeyP')) {
+    w.paused = !w.paused;
+    w.message = w.paused ? 'Paused — P to resume' : '';
+    w.messageT = w.paused ? 999 : 0;
+  }
+  if (w.paused) return;
+
+  w.runTime += dt;
+  if (w.introT > 0) w.introT -= dt;
+
+  // Boss dialogue advances line by line.
+  if (w.dialogue) {
+    w.dialogue.t += dt;
+    if (w.dialogue.t > 2.6) {
+      w.dialogue.t = 0;
+      w.dialogue.idx += 1;
+      if (w.dialogue.idx < w.dialogue.lines.length) {
+        w.message = w.dialogue.lines[w.dialogue.idx];
+        w.messageT = 2.6;
+      } else {
+        w.dialogue = null;
+      }
+    }
+  }
+
+  // Combo decays after 3s without a kill.
+  if (w.combo.timer > 0) {
+    w.combo.timer -= dt;
+    if (w.combo.timer <= 0) w.combo.count = 0;
+  }
+
+  // Night 1 tutorial tips, on a timer.
+  if (w.night === 1) {
+    const tips = [
+      [2, 'Move with WASD — your flame drains. Collect the little flames to feed it.'],
+      [12, 'Hold left click to fire. Right-click (or E) drops a light-trap.'],
+      [24, 'SPACE dashes through danger. F fires a piercing lance (3s cooldown).'],
+    ];
+    if (w.tipsShown < tips.length && w.runTime >= tips[w.tipsShown][0]) {
+      w.message = tips[w.tipsShown][1];
+      w.messageT = 5;
+      w.tipsShown += 1;
+    }
+  }
+
+  updatePlayer(w, dt, input, audio);
+  if (w.screen !== 'playing') return; // player may have died from flame drain
+  updateSpawning(w, dt);
+  updateTelegraphs(w, dt);
+  updateEnemies(w, dt, audio);
+  updateBoss(w, dt, audio);
+  updateBullets(w, dt, audio);
+  resolveBoltHits(w, audio);
+  updateParticles(w, dt);
+
+  if (nightIsClear(w)) clearNight(w, audio);
+}
+
+function updateTitle(w, input, audio) {
+  // Difficulty: 1/2/3 or click. Start: Enter, Space, or click START.
+  // B opens the Codex (bestiary).
+  if (input.pressed('Digit1')) w.selectedDiff = 0;
+  if (input.pressed('Digit2')) w.selectedDiff = 1;
+  if (input.pressed('Digit3')) w.selectedDiff = 2;
+  if (input.pressed('KeyB')) { w.screen = 'codex'; w.codexTab = 0; audio.play('click'); return; }
+  if (input.pressed('Enter') || input.pressed('Space')) {
+    audio.unlock();
+    startRun(w, audio);
+    return;
+  }
+  for (const c of input.takeClicks()) {
+    audio.unlock();
+    const d = hitDifficulty(w, c.x, c.y);
+    if (d !== -1) { w.selectedDiff = d; audio.play('click'); continue; }
+    if (c.y > 600 && c.y < 656 && c.x > 540 && c.x < 740) {
+      startRun(w, audio);
+      return;
+    }
+    if (c.y > 660 && c.y < 684 && c.x > 540 && c.x < 740) {
+      w.screen = 'codex'; w.codexTab = 0; audio.play('click'); return;
+    }
+  }
+  updateParticles(w, 1 / 60);
+  // Ambient title motes drifting for atmosphere.
+  if (w.rng() < 0.12) {
+    w.particles.push({
+      x: w.rng() * VIEW.W, y: VIEW.H + 10,
+      vx: (w.rng() - 0.5) * 20, vy: -20 - w.rng() * 30,
+      life: 4, maxLife: 4, color: '#ffb347', size: 2 + w.rng() * 3,
+    });
+  }
+}
+
+export function hitDifficulty(w, x, y) {
+  // Title difficulty buttons: three boxes centred at y=470, each 200x54.
+  if (y < 470 || y > 524) return -1;
+  for (let i = 0; i < 3; i += 1) {
+    const bx = 340 + i * 220;
+    if (x >= bx && x <= bx + 200) return i;
+  }
+  return -1;
+}
+
+export function startRun(w, audio) {
+  const fresh = createWorld(w.seed, DIFFICULTIES[w.selectedDiff].id);
+  // Keep the chosen difficulty, history and best scores.
+  Object.assign(w, fresh, { history: w.history, best: w.best, selectedDiff: w.selectedDiff });
+  audio.play('click');
+  startNight(w, 1);
+}
+
+export function resetToTitle(w) {
+  const keep = { history: w.history, best: w.best, selectedDiff: w.selectedDiff, seed: w.seed };
+  const fresh = createWorld(w.seed, DIFFICULTIES[w.selectedDiff].id);
+  Object.assign(w, fresh, keep);
+  w.screen = 'title';
+}
+
+function updateIntermission(w, input, audio) {
+  if (input.pressed('Digit1')) chooseRelic(w, 0, audio);
+  else if (input.pressed('Digit2')) chooseRelic(w, 1, audio);
+  else if (input.pressed('Digit3')) chooseRelic(w, 2, audio);
+  else if (input.pressed('KeyR')) rerollRelics(w, audio);
+  else if (input.pressed('Enter') && w.relicChoices.length === 0) {
+    startNight(w, w.night + 1);
+    return;
+  }
+  for (const c of input.takeClicks()) {
+    // Relic cards: three boxes at y=170..330.
+    if (w.relicChoices.length > 0) {
+      for (let i = 0; i < 3; i += 1) {
+        const bx = 250 + i * 270;
+        if (c.x >= bx && c.x <= bx + 250 && c.y >= 170 && c.y <= 330) {
+          chooseRelic(w, i, audio);
           break;
         }
       }
-    }
-    for (let i = state.enemyBullets.length - 1; i >= 0; i -= 1) {
-      const bullet = state.enemyBullets[i];
-      bullet.x += bullet.vx * dt;
-      bullet.y += bullet.vy * dt;
-      if (bullet.x < -20 || bullet.x > FIELD.width + 20 || bullet.y < -20 || bullet.y > FIELD.height + 20) {
-        state.enemyBullets.splice(i, 1);
-        continue;
-      }
-      const player = state.player;
-      const rr = bullet.radius + PLAYER.radius - 4;
-      if (dist2(bullet.x, bullet.y, player.x, player.y) < rr * rr) {
-        state.enemyBullets.splice(i, 1);
-        const hit = hurtPlayer();
-        events |= hit;
-        if (hit & EVENT_OVER) return events;
-      }
-    }
-    return events;
-  }
-
-  function stepPickups(dt) {
-    const player = state.player;
-    for (let i = state.pickups.length - 1; i >= 0; i -= 1) {
-      const pickup = state.pickups[i];
-      pickup.life -= dt;
-      pickup.bob += dt * 3;
-      if (pickup.life <= 0) {
-        state.pickups.splice(i, 1);
-        continue;
-      }
-      const d2 = dist2(pickup.x, pickup.y, player.x, player.y);
-      if (d2 < PICKUP.magnetRadius * PICKUP.magnetRadius) {
-        const d = Math.sqrt(d2) || 1;
-        pickup.x += ((player.x - pickup.x) / d) * PICKUP.magnetSpeed * dt;
-        pickup.y += ((player.y - pickup.y) / d) * PICKUP.magnetSpeed * dt;
-      }
-      if (d2 < (PLAYER.radius + 16) * (PLAYER.radius + 16)) {
-        state.pickups.splice(i, 1);
-        if (pickup.kind === 'orb') {
-          player.lamp = Math.min(PLAYER.lampMax, player.lamp + 14);
-          state.score += 10 * state.multiplier;
-          floatText(player.x, player.y - 28, '+10', '#ffe9a8');
-        } else if (pickup.kind === 'heart') {
-          player.hearts = Math.min(PLAYER.maxHearts, player.hearts + 1);
-          floatText(player.x, player.y - 28, '+1 ♥', '#ff6b81');
-        } else if (pickup.kind === 'rapid') {
-          player.rapidTimer = PICKUP.rapidSeconds;
-          floatText(player.x, player.y - 28, 'RAPID FIRE!', '#7fe7ff');
-        } else if (pickup.kind === 'spread') {
-          player.spreadTimer = PICKUP.spreadSeconds;
-          floatText(player.x, player.y - 28, 'SPREAD SHOT!', '#c792ff');
-        } else if (pickup.kind === 'shield') {
-          player.shieldTimer = PICKUP.shieldSeconds;
-          floatText(player.x, player.y - 28, 'SHIELD!', '#9df2ff');
-        }
-        burst(pickup.x, pickup.y, '#ffe9a8', 8, 140, 0.4);
-        return EVENT_PICKUP;
-      }
-    }
-    return 0;
-  }
-
-  function stepParticles(dt) {
-    for (let i = state.particles.length - 1; i >= 0; i -= 1) {
-      const p = state.particles[i];
-      p.life -= dt;
-      if (p.life <= 0) {
-        state.particles.splice(i, 1);
-        continue;
-      }
-      p.x += p.vx * dt;
-      p.y += p.vy * dt;
-      p.vx *= 0.96;
-      p.vy *= 0.96;
-      if (p.ring) p.radius += 260 * dt;
-    }
-    for (let i = state.texts.length - 1; i >= 0; i -= 1) {
-      const t = state.texts[i];
-      t.life -= dt;
-      t.y -= 34 * dt;
-      if (t.life <= 0) state.texts.splice(i, 1);
-    }
-    state.shake = Math.max(0, state.shake - 40 * dt);
-    state.flash = Math.max(0, state.flash - 1.6 * dt);
-  }
-
-  function reset() {
-    const fresh = freshState();
-    for (const key of Object.keys(fresh)) state[key] = fresh[key];
-    spawnQueue = [];
-    spawnTimer = 0;
-    betweenTimer = WAVE.betweenSeconds;
-    elapsed = 0;
-  }
-
-  /** Advance one fixed step. `attract` runs the world as a title-screen
-   * backdrop: wisps drift, nothing can hurt the player. Returns events. */
-  function step(dt, move, aim, firing, dash, attract) {
-    state.time += dt;
-    elapsed += dt;
-    if (state.comboTimer > 0) {
-      state.comboTimer -= dt;
-      if (state.comboTimer <= 0) {
-        state.combo = 0;
-        state.multiplier = 1;
-      }
-    }
-    if (attract) {
-      if (state.enemies.length < 14 && random.chance(0.02)) spawnEnemy('wisp');
-      for (const enemy of state.enemies) {
-        enemy.wobble += dt * 2;
-        enemy.x += Math.cos(enemy.wobble) * 24 * dt;
-        enemy.y += Math.sin(enemy.wobble * 0.7) * 18 * dt + 12 * dt;
-        if (enemy.y > FIELD.height + 40) {
-          enemy.y = -30;
-          enemy.x = random.range(40, FIELD.width - 40);
-        }
-      }
-      stepParticles(dt);
-      return 0;
-    }
-
-    stepPlayer(dt, move, aim, firing, dash);
-    let events = stepEnemies(dt);
-    if (events & EVENT_OVER) return events;
-    events |= stepBullets(dt);
-    if (events & EVENT_OVER) return events;
-    events |= stepPickups(dt);
-
-    if (state.waveActive) {
-      spawnTimer -= dt;
-      const interval = Math.max(WAVE.minSpawnInterval, WAVE.spawnInterval - state.wave * 0.05);
-      if (spawnQueue.length > 0 && spawnTimer <= 0) {
-        spawnTimer = interval;
-        spawnEnemy(spawnQueue.shift());
-      }
-      if (spawnQueue.length === 0 && state.enemies.length === 0) {
-        state.waveActive = false;
-        state.score += WAVE.clearBonus * state.wave;
-        betweenTimer = WAVE.betweenSeconds;
-        floatText(FIELD.width / 2, FIELD.height / 2 - 60, `WAVE ${state.wave} CLEAR  +${WAVE.clearBonus * state.wave}`, '#ffd166');
-      }
+      // Reroll button.
+      if (c.x >= 1060 && c.x <= 1180 && c.y >= 180 && c.y <= 216) rerollRelics(w, audio);
     } else {
-      betweenTimer -= dt;
-      if (betweenTimer <= 0) events |= startWave();
+      // Shop rows: y starts 200, each 44 high.
+      for (let i = 0; i < w.shop.length; i += 1) {
+        const by = 200 + i * 44;
+        if (c.x >= 880 && c.x <= 1210 && c.y >= by && c.y <= by + 38) {
+          buyShopItem(w, i, audio);
+          break;
+        }
+      }
+      // Rest + gamble buttons.
+      if (c.y >= 480 && c.y <= 520) {
+        if (c.x >= 880 && c.x <= 1040) restAtMarket(w, audio);
+        else if (c.x >= 1050 && c.x <= 1210) gambleRelic(w, audio);
+      }
+      // Continue button.
+      if (c.x >= 540 && c.x <= 740 && c.y >= 620 && c.y <= 668) {
+        audio.play('click');
+        startNight(w, w.night + 1);
+        return;
+      }
     }
-
-    stepParticles(dt);
-    return events;
   }
+}
 
-  reset();
+function handleClick(w, input, audio) {
+  for (const c of input.takeClicks()) {
+    if (c.y > 600 && c.y < 656 && c.x > 540 && c.x < 740) {
+      audio.play('click');
+      resetToTitle(w);
+      return;
+    }
+  }
+}
 
+// Small read-only snapshot for the smoke test and the shot scenes.
+export function stateSnapshot(w) {
   return {
-    state,
-    reset,
-    step,
-    startWave,
-    get elapsed() {
-      return elapsed;
-    },
+    screen: w.screen, night: w.night, score: w.score, embers: w.embers,
+    hearts: w.player.hearts, flame: Math.round(w.player.flame),
+    enemies: w.enemies.length, bolts: w.bolts.length,
+    boss: w.boss ? w.boss.name : null, relics: w.relics.length,
+    feats: w.feats.size, paused: w.paused,
   };
+}
+
+function updateCodex(w, input, audio) {
+  // Tabs: 1-5 or click the tab strip. B / Escape / Enter closes.
+  if (input.pressed('KeyB') || input.pressed('Escape') || input.pressed('Enter')) {
+    w.screen = 'title';
+    audio.play('click');
+    return;
+  }
+  for (let i = 0; i < 8; i += 1) {
+    if (input.pressed(`Digit${i + 1}`)) { w.codexTab = i; audio.play('click'); }
+  }
+  for (const c of input.takeClicks()) {
+    if (c.y >= 120 && c.y <= 152) {
+      for (let i = 0; i < 8; i += 1) {
+        const bx = 40 + i * 152;
+        if (c.x >= bx && c.x <= bx + 145) { w.codexTab = i; audio.play('click'); break; }
+      }
+    }
+    if (c.y > 640 && c.y < 680 && c.x > 540 && c.x < 740) {
+      w.screen = 'title';
+      audio.play('click');
+      return;
+    }
+  }
+  updateParticles(w, 1 / 60);
 }
